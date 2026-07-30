@@ -9,6 +9,7 @@ from the updater's point of view.
 - `cmux-macos-arm64.zip`
 - `cmux-windows-x64-installer.exe`
 - `cmux-windows-x64.zip`
+- `cmux-linux-x64-installer.run`
 - `cmux-linux-x64.deb`
 - `cmux-linux-x64.zip`
 - `cmux-browser-source-<version>.tar.zst`
@@ -23,7 +24,8 @@ from the updater's point of view.
 1. Build from one reviewed cmux Browser commit and record it in provenance.
 2. Verify native signatures and notarization where applicable.
 3. Exercise fresh-install launch checks on all three operating systems.
-4. Exercise an older nightly updating to the candidate on all three systems.
+4. Exercise an older nightly updating to the candidate on all three systems,
+   using the per-user Linux installation rather than the root-owned `.deb`.
 5. Upload packages, corresponding source, notices, checksums, and provenance.
 6. Confirm every uploaded asset is anonymously downloadable and matches its
    recorded digest.

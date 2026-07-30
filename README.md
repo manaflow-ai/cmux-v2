@@ -12,7 +12,13 @@ release will contain:
 | --- | --- | --- |
 | macOS (Apple silicon) | `cmux-macos-arm64.dmg` | `cmux-macos-arm64.zip` |
 | Windows (x64) | `cmux-windows-x64-installer.exe` | `cmux-windows-x64.zip` |
-| Debian/Ubuntu (x64) | `cmux-linux-x64.deb` | `cmux-linux-x64.zip` |
+| Linux (x64) | `cmux-linux-x64-installer.run` | `cmux-linux-x64.zip` |
+
+The Linux website installer places the browser below `~/.local` without root
+access, which lets the in-app updater replace it atomically. A
+`cmux-linux-x64.deb` is also published for package-manager-managed systems;
+because that installation is root-owned, update it through the package manager
+rather than the in-app updater.
 
 `update.json` is the signed manifest consumed by the browser. It is published
 only after every package, checksum, notice bundle, and corresponding-source
