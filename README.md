@@ -44,14 +44,9 @@ SHA-256 8feeefcadd6c55cfeb3dc3aeb52ca95649d914cc1430c9c798c9567374b6f657
 
 ## Licensing
 
-The text and metadata maintained in this repository are proprietary and
-all-rights-reserved; see [`LICENSE`](LICENSE).
+Original material in this repository and the combined cmux Browser work are
+distributed under GPL-3.0-or-later; see [`LICENSE`](LICENSE).
 
-The current cmux Browser executable contains GPL-covered cmux and Helium
-material and is therefore distributed under GPL-3.0-or-later, together with
-the exact corresponding source and third-party notices for each release.
-Repository terms do not override those rights. See
-[`BINARY-LICENSING.md`](BINARY-LICENSING.md).
-
-Manaflow may choose a different license for future material it wholly owns.
-That would not relicense existing third-party or outside-contributor material.
+Every release includes its exact corresponding source, build/install scripts,
+GPL text, and third-party notices. See
+[`BINARY-LICENSING.md`](BINARY-LICENSING.md) for the release contract.
