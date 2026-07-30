@@ -1,8 +1,8 @@
 # Browser binary licensing
 
-This repository is a distribution endpoint, not the product source
-repository. Its proprietary repository license does not change the licenses of
-downloadable browser builds.
+This repository is a distribution endpoint, not the product development
+repository. Its original material and the combined GPL-covered browser work
+are distributed under GPL-3.0-or-later.
 
 ## Current nightly builds
 
@@ -27,13 +27,13 @@ GPL-3.0-or-later for the combined GPL-covered work. Each release must include:
 The corresponding source must remain available from the same release page at
 no charge for as long as the object code is offered there.
 
-## Future licensing
+## GPL grant
 
-Manaflow may release future, independently authored material under proprietary
-terms if it controls the necessary rights. Doing so requires removing,
-replacing, or separately licensing incompatible GPL-derived material and
-honoring all outside contributions. A later license decision cannot revoke
-rights already granted for GPL-covered releases.
+The GPL rights granted for repository revisions and browser releases are
+irrevocable as long as recipients comply with the license. A future,
+independently authored project may use different terms only if it contains no
+incompatible GPL-derived or outside-contributor material; that cannot revoke
+rights already granted for cmux-v2 releases.
 
 This document describes the release policy; it is not a substitute for the
 license files accompanying a particular asset.
