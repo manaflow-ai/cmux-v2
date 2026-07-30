@@ -3,8 +3,8 @@
 This repository is a distribution endpoint, not the product development
 repository. Its original material and the combined GPL-covered browser work
 are distributed under GPL-3.0-or-later. See [`LICENSE`](LICENSE) for the
-standard terms and [`LICENSE-NOTICE.md`](LICENSE-NOTICE.md) for the copyright
-and scope notice.
+standard terms and [`COPYRIGHT.md`](COPYRIGHT.md) for the copyright and scope
+notice.
 
 ## Current nightly builds
 

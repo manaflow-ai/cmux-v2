@@ -46,7 +46,7 @@ SHA-256 8feeefcadd6c55cfeb3dc3aeb52ca95649d914cc1430c9c798c9567374b6f657
 
 Original material in this repository and the combined cmux Browser work are
 distributed under GPL-3.0-or-later; see [`LICENSE`](LICENSE) and the
-[`LICENSE-NOTICE.md`](LICENSE-NOTICE.md) copyright and scope notice.
+[`COPYRIGHT.md`](COPYRIGHT.md) copyright and scope notice.
 
 Every release includes its exact corresponding source, build/install scripts,
 GPL text, and third-party notices. See

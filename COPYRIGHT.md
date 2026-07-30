@@ -1,4 +1,4 @@
-# License notice
+# Copyright and license scope
 
 Copyright (c) 2024-present Manaflow, Inc.
 
