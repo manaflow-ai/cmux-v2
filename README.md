@@ -6,13 +6,15 @@ builds. Product development happens in a separate private repository.
 ## Downloads
 
 The moving [`nightly`](https://github.com/manaflow-ai/cmux-v2/releases/tag/nightly)
-release will contain:
+release enables platforms incrementally. Linux x64 is the first public
+platform; macOS and Windows become available only after their native signing
+and fresh-install checks are complete.
 
-| Platform | First install | In-app update payload |
-| --- | --- | --- |
-| macOS (Apple silicon) | `cmux-macos-arm64.dmg` | `cmux-macos-arm64.zip` |
-| Windows (x64) | `cmux-windows-x64-installer.exe` | `cmux-windows-x64.zip` |
-| Linux (x64) | `cmux-linux-x64-installer.run` | `cmux-linux-x64.zip` |
+| Platform | Rollout | First install | In-app update payload |
+| --- | --- | --- | --- |
+| Linux (x64) | Enabled first | `cmux-linux-x64-installer.run` | `cmux-linux-x64.zip` |
+| macOS (Apple silicon) | Pending signed release | `cmux-macos-arm64.dmg` | `cmux-macos-arm64.zip` |
+| Windows (x64) | Pending signed release | `cmux-windows-x64-installer.exe` | `cmux-windows-x64.zip` |
 
 The Linux website installer places the browser below `~/.local` without root
 access, which lets the in-app updater replace it atomically. A
@@ -22,11 +24,13 @@ rather than the in-app updater.
 
 `update.json` is the signed manifest consumed by the browser. It is published
 only after every package, checksum, notice bundle, and corresponding-source
-artifact referenced by that nightly is available.
+artifact for each enabled platform is available. A platform does not become
+supported merely because a filename is documented here: its installer and
+update payload must both appear on the release and in the signed manifest.
 
-Until the first complete release is present, there is no supported download.
-Do not obtain builds from Actions artifacts or private source-repository
-releases: those are not the public update channel.
+Until a platform is enabled on the public release, there is no supported
+download for that platform. Do not obtain builds from Actions artifacts or
+private source-repository releases: those are not the public update channel.
 
 ## Update authenticity
 
