@@ -42,6 +42,12 @@ has passed the checks below and is present on the public release.
 8. Confirm the manifest and every URL in its decoded payload are anonymously
    downloadable before updating website availability.
 
+When a platform is enabled for the first time and no older public nightly
+exists, step 4 is replaced by clean-install launch, atomic reinstall, and
+signed-manifest payload validation on that operating system. This bootstrap
+exception applies only to that platform's first publication; its next nightly
+must exercise a real predecessor-to-candidate update.
+
 If any step fails, retain the previous `update.json`; clients will continue to
 use the last complete nightly.
 
