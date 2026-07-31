@@ -48,9 +48,13 @@ SHA-256 8feeefcadd6c55cfeb3dc3aeb52ca95649d914cc1430c9c798c9567374b6f657
 
 ## Licensing
 
-Original material in this repository and the combined cmux Browser work are
-distributed under GPL-3.0-or-later; see [`LICENSE`](LICENSE) and the
-[`COPYRIGHT.md`](COPYRIGHT.md) copyright and scope notice.
+Original material in this repository and independently authored cmux portions
+of the browser are distributed under GPL-3.0-or-later. Current cmux Browser
+releases combine that material with modified Helium material licensed under
+GPL-3.0-only, so the combined GPL-covered browser work is distributed under
+GPL-3.0-only. Compatible third-party components retain their respective
+licenses. See [`LICENSE`](LICENSE) and the [`COPYRIGHT.md`](COPYRIGHT.md)
+copyright and scope notice.
 
 Every release includes its exact corresponding source, build/install scripts,
 GPL text, and third-party notices. See
