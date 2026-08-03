@@ -10,6 +10,25 @@ release enables platforms incrementally. Linux x64 is the first public
 platform; macOS and Windows become available only after their native signing
 and fresh-install checks are complete.
 
+Direct nightly links:
+
+- Linux x64 per-user installer:
+  [`cmux-linux-x64-installer.run`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-linux-x64-installer.run)
+- Linux x64 Debian package:
+  [`cmux-linux-x64.deb`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-linux-x64.deb)
+- Signed in-app update feed:
+  [`update.json`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/update.json)
+
+These URLs are stable across nightly replacements. The macOS and Windows
+download paths remain unpublished until their complete signed asset groups
+pass the release contract below; before then, those URLs intentionally return
+404 rather than serving unsigned candidates.
+
+Reserved post-signing installer paths:
+
+- macOS Apple silicon: `https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-macos-arm64.dmg`
+- Windows x64: `https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-windows-x64-installer.exe`
+
 | Platform | Rollout | First install | In-app update payload |
 | --- | --- | --- | --- |
 | Linux (x64) | Enabled first | `cmux-linux-x64-installer.run` | `cmux-linux-x64.zip` |
