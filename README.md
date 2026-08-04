@@ -5,19 +5,28 @@ builds. Product development happens in a separate private repository.
 
 ## Downloads
 
+### Linux x64 nightly
+
+**[Download the Linux x64 nightly installer (.run)](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-linux-x64-installer.run)**
+
+This is the recommended first-install download for a Linux desktop. It installs
+below `~/.local` without root access so cmux Browser can apply future signed
+updates atomically.
+
+Other Linux nightly files:
+
+- Debian/Ubuntu package:
+  [download `cmux-linux-x64.deb`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-linux-x64.deb).
+  This root-owned installation must be updated through the package manager.
+- In-app updater payload only, **not a first installer**:
+  [`cmux-linux-x64.zip`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-linux-x64.zip).
+- Signed in-app update feed:
+  [`update.json`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/update.json).
+
 The moving [`nightly`](https://github.com/manaflow-ai/cmux-v2/releases/tag/nightly)
 release enables platforms incrementally. Linux x64 is the first public
 platform; macOS and Windows become available only after their native signing
 and fresh-install checks are complete.
-
-Direct nightly links:
-
-- Linux x64 per-user installer:
-  [`cmux-linux-x64-installer.run`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-linux-x64-installer.run)
-- Linux x64 Debian package:
-  [`cmux-linux-x64.deb`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/cmux-linux-x64.deb)
-- Signed in-app update feed:
-  [`update.json`](https://github.com/manaflow-ai/cmux-v2/releases/download/nightly/update.json)
 
 These URLs are stable across nightly replacements. The macOS and Windows
 download paths remain unpublished until their complete signed asset groups
@@ -34,12 +43,6 @@ Reserved post-signing installer paths:
 | Linux (x64) | Enabled first | `cmux-linux-x64-installer.run` | `cmux-linux-x64.zip` |
 | macOS (Apple silicon) | Pending signed release | `cmux-macos-arm64.dmg` | `cmux-macos-arm64.zip` |
 | Windows (x64) | Pending signed release | `cmux-windows-x64-installer.exe` | `cmux-windows-x64.zip` |
-
-The Linux website installer places the browser below `~/.local` without root
-access, which lets the in-app updater replace it atomically. A
-`cmux-linux-x64.deb` is also published for package-manager-managed systems;
-because that installation is root-owned, update it through the package manager
-rather than the in-app updater.
 
 `update.json` is the signed manifest consumed by the browser. It is published
 only after every package, checksum, notice bundle, and corresponding-source
