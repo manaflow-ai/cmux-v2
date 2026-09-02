@@ -1,4 +1,6 @@
-# CLA policy changes require two trusted maintainer approvals.
+# CODEOWNERS owners are an OR set. Branch protection must require both
+# trusted maintainer approvals for CLA policy changes.
+.github/CODEOWNERS @austinywang @azooz2003-bit
 .github/workflows/cla.yml @austinywang @azooz2003-bit
 .github/scripts/ @austinywang @azooz2003-bit
 signatures/ @austinywang @azooz2003-bit

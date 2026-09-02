@@ -68,7 +68,6 @@ gh() {
   local run_name='CLA Assistant v3'
   local run_prs
   run_prs="[{\"number\":123,\"base\":{\"ref\":\"main\",\"sha\":\"${base_sha}\",\"repo\":{\"id\":100,\"full_name\":\"${GH_REPO}\"}},\"head\":{\"ref\":\"feature\",\"sha\":\"${source_sha}\",\"repo\":{\"id\":200,\"full_name\":\"contributor/${GH_REPO#*/}\"}}}]"
-  local run_head_repository='{"id":200,"full_name":"contributor/cmux-skills"}'
   run_head_repository="{\"id\":200,\"full_name\":\"contributor/${GH_REPO#*/}\"}"
   local check_app_id=15368
   local check_details="https://github.com/${GH_REPO}/actions/runs/400/job/500"
