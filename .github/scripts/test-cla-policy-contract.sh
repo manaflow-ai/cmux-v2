@@ -52,7 +52,7 @@ abort "rerun permissions are too broad or incomplete" unless rerun_permissions =
 }
 RUBY
 
-for path in '.github/workflows/cla.yml' '.github/scripts/' 'signatures/' 'CLA.md'; do
+for path in '.github/workflows/cla.yml' '.github/scripts/' 'signatures/' 'CLA.md' '.github/CODEOWNERS'; do
   grep -Eq "^${path//\//\\/}[[:space:]]+@austinywang[[:space:]]+@azooz2003-bit$" "${CODEOWNERS}"
 done
 
