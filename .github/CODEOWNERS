@@ -1,0 +1,5 @@
+# CLA policy changes require two trusted maintainer approvals.
+.github/workflows/cla.yml @austinywang @azooz2003-bit
+.github/scripts/ @austinywang @azooz2003-bit
+signatures/ @austinywang @azooz2003-bit
+CLA.md @austinywang @azooz2003-bit
