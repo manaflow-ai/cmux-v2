@@ -56,10 +56,11 @@ for path in '.github/workflows/cla.yml' '.github/scripts/' 'signatures/' 'CLA.md
   grep -Eq "^${path//\//\\/}[[:space:]]+@austinywang[[:space:]]+@azooz2003-bit$" "${CODEOWNERS}"
 done
 
-# The canary models the maintained action's opener-only numeric exemptions. It
-# proves a matching unknown opener remains eligible, an unknown opener with no
-# authored commit is rejected, and Aziz's authenticated mismatch is exempt. It
-# never signs a CLA or writes repository state.
+# The canary models the maintained action's authenticated-opener exemptions.
+# It proves a matching unknown opener remains eligible, an unknown opener with
+# no authored commit is rejected, and Aziz's authenticated mismatch is exempt.
+# The action also omits that allowlisted opener from the signer set. Co-authors
+# and other contributors remain subject to the normal signature check.
 allowlist_values="$(grep -E 'allowlist-ids:' "${WORKFLOW}" | grep -oE '[0-9]{1,20}(,[0-9]{1,20})+' | sort -u)"
 [[ "${allowlist_values}" == '38676809,67667005' ]]
 allowlist="${allowlist_values}"
@@ -84,12 +85,12 @@ if ! opener_authorship_allowed "${matching_untrusted_id}" true; then
   exit 1
 fi
 # With the opener-authorship guard enabled, an unknown identity without an
-# authored commit is rejected. The allowlist is not a general signer gate.
+# authored commit is rejected. The exemption is limited to the live PR opener.
 if opener_authorship_allowed "${untrusted_id}" false; then
   echo "unknown un-authored opener was incorrectly exempted" >&2
   exit 1
 fi
-# Austin/Aziz are the only documented exemptions for an authenticated mismatch.
+# Austin/Aziz are the only documented authenticated-opener exemptions.
 if ! opener_authorship_allowed "${aziz_id}" false; then
   echo "Aziz's documented opener exemption was rejected" >&2
   exit 1
