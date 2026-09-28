@@ -20,5 +20,5 @@ controls the necessary rights. Those terms do not relicense third-party
 material or outside contributions for which Manaflow lacks a separate grant.
 A product that combines cmux material with third-party material remains subject
 to every applicable third-party license and notice. Each release includes its
-reviewed third-party notice artifacts. Contact founders@manaflow.com for
+reviewed third-party notice artifacts. Contact founders@cmux.com for
 details about the eligible scope.
