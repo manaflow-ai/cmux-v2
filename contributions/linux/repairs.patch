@@ -1,0 +1,3130 @@
+From d81259d8a87c9b4e3ddcb3b022315eb37a9332da Mon Sep 17 00:00:00 2001
+From: Steve-Strange <120027032+Steve-Strange@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:12:08 +0800
+Subject: [PATCH 1/4] fix(linux): preserve running backend executables across
+ upgrades
+
+Keep the previous installation while /proc identifies processes executing from it, so surviving cmux-tui daemons can spawn terminal hosts. Cover the updater and user installer with live-executable regressions.
+---
+ .../browser/cmux_term/cmux_update_script.cc   | 17 +++++++--
+ .../cmux_term/cmux_update_script_test.cc      | 37 +++++++++++++++++++
+ scripts/build-linux-user-installer.sh         | 11 +++++-
+ scripts/test-linux-user-installer.sh          | 30 ++++++++++++++-
+ 4 files changed, 89 insertions(+), 6 deletions(-)
+
+diff --git a/overlay/chrome/browser/cmux_term/cmux_update_script.cc b/overlay/chrome/browser/cmux_term/cmux_update_script.cc
+index 8c0b031..abcbc41 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_update_script.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_update_script.cc
+@@ -34,6 +34,19 @@ try {
+   const char* relaunch = platform == UpdateInstallPlatform::kMac
+                              ? "open \"$current\""
+                              : "nohup \"$current/$relaunch\" >/dev/null 2>&1 &";
++  const char* cleanup = platform == UpdateInstallPlatform::kLinux
++      ? R"SHELL(  # The browser can exit while its PTY daemon and hosts stay alive.
++  # current_exe() in that daemon must remain executable for new terminals.
++  in_use=0
++  for executable in /proc/[0-9]*/exe; do
++    target=$(readlink "$executable" 2>/dev/null) || continue
++    case "$target" in "$backup"/*) in_use=1; break ;; esac
++  done
++  if [ "$in_use" -eq 0 ]; then
++    rm -rf -- "$backup"
++  fi
++)SHELL"
++      : "  rm -rf -- \"$backup\"\n";
+   return std::string(R"SHELL(#!/bin/sh
+ set -eu
+ parent_pid="$1"
+@@ -48,9 +61,7 @@ done
+ backup="${current}.cmux-old.$$"
+ mv -- "$current" "$backup"
+ if mv -- "$staged" "$current"; then
+-  )SHELL") + relaunch + R"SHELL(
+-  rm -rf -- "$backup"
+-else
++  )SHELL") + relaunch + "\n" + cleanup + R"SHELL(else
+   mv -- "$backup" "$current"
+   exit 1
+ fi
+diff --git a/overlay/chrome/browser/cmux_term/cmux_update_script_test.cc b/overlay/chrome/browser/cmux_term/cmux_update_script_test.cc
+index 220ed96..5acab17 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_update_script_test.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_update_script_test.cc
+@@ -12,7 +12,9 @@
+ #include <thread>
+ 
+ #if !defined(_WIN32)
++#include <signal.h>
+ #include <sys/stat.h>
++#include <sys/wait.h>
+ #include <unistd.h>
+ #endif
+ 
+@@ -99,6 +101,41 @@ int main() {
+     }
+   }
+   Check(!backup_remains, "POSIX installer removed its rollback copy");
++#if defined(__linux__)
++  // Reproduce a persistent PTY daemon surviving the browser update. Its old
++  // executable path must still work when it spawns another terminal host.
++  std::filesystem::create_directories(staged);
++  std::filesystem::copy_file("/bin/sleep", current / "cmux-tui");
++  std::filesystem::copy_file(current / "cmux-browser",
++                             staged / "cmux-browser");
++  const pid_t daemon = fork();
++  Check(daemon >= 0, "started a persistent backend fixture");
++  if (daemon == 0) {
++    execl((current / "cmux-tui").c_str(), "cmux-tui", "30", nullptr);
++    _exit(127);
++  }
++  const auto proc_exe = std::filesystem::path("/proc") /
++                        std::to_string(daemon) / "exe";
++  bool started = false;
++  for (int attempt = 0; attempt < 100; ++attempt) {
++    std::error_code error;
++    if (std::filesystem::read_symlink(proc_exe, error) == current / "cmux-tui") {
++      started = true;
++      break;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++  }
++  Check(started, "backend fixture runs from the old install");
++  Check(std::system(command.c_str()) == 0,
++        "update completed with an active backend");
++  const auto retained_exe = std::filesystem::read_symlink(proc_exe);
++  Check(std::filesystem::exists(retained_exe),
++        "active backend executable retained after update");
++  Check(std::system(("'" + retained_exe.string() + "' 0").c_str()) == 0,
++        "old backend can still spawn a host from its executable path");
++  kill(daemon, SIGTERM);
++  waitpid(daemon, nullptr, 0);
++#endif
+   std::filesystem::remove_all(test_root);
+ #endif
+ 
+diff --git a/scripts/build-linux-user-installer.sh b/scripts/build-linux-user-installer.sh
+index d9287a0..cbdaba4 100755
+--- a/scripts/build-linux-user-installer.sh
++++ b/scripts/build-linux-user-installer.sh
+@@ -81,6 +81,13 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/cmux-linux-install.XXXXXX")"
+ backup="${install_root}.cmux-old.$$"
+ had_previous=0
+ promoted=0
++backup_in_use() {
++  for executable in /proc/[0-9]*/exe; do
++    target=$(readlink "$executable" 2>/dev/null) || continue
++    case "$target" in "$backup"/*) return 0 ;; esac
++  done
++  return 1
++}
+ cleanup() {
+   rc=$?
+   trap - EXIT INT TERM
+@@ -91,7 +98,7 @@ cleanup() {
+     fi
+   fi
+   rm -rf -- "$work"
+-  if [ -e "$backup" ]; then
++  if [ -e "$backup" ] && ! backup_in_use; then
+     rm -rf -- "$backup"
+   fi
+   exit "$rc"
+@@ -140,7 +147,7 @@ if command -v update-desktop-database >/dev/null 2>&1; then
+   update-desktop-database "$(dirname "$desktop_file")" >/dev/null 2>&1 || true
+ fi
+ 
+-if [ "$had_previous" -eq 1 ]; then
++if [ "$had_previous" -eq 1 ] && ! backup_in_use; then
+   rm -rf -- "$backup"
+ fi
+ promoted=0
+diff --git a/scripts/test-linux-user-installer.sh b/scripts/test-linux-user-installer.sh
+index 476582d..9952819 100755
+--- a/scripts/test-linux-user-installer.sh
++++ b/scripts/test-linux-user-installer.sh
+@@ -3,7 +3,15 @@ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ TMP="$(mktemp -d "${TMPDIR:-/tmp}/cmux-linux-installer-test.XXXXXX")"
+-trap 'rm -rf "$TMP"' EXIT
++cmux_test_backend=
++cleanup() {
++  if [ -n "$cmux_test_backend" ]; then
++    kill "$cmux_test_backend" 2>/dev/null || true
++    wait "$cmux_test_backend" 2>/dev/null || true
++  fi
++  rm -rf "$TMP"
++}
++trap cleanup EXIT
+ 
+ make_fixture() {
+   local version="$1"
+@@ -51,6 +59,26 @@ run_installer
+ test "$("$TMP/home/opt/cmux-browser-nightly/chrome")" = v2
+ test -z "$(find "$TMP/home/opt" -maxdepth 1 -name '*.cmux-old.*' -print)"
+ 
++# A headless PTY backend can outlive its browser. Reinstalling must leave its
++# current_exe() path executable so creating another terminal still works.
++cp /bin/sleep "$TMP/home/opt/cmux-browser-nightly/cmux-tui"
++"$TMP/home/opt/cmux-browser-nightly/cmux-tui" 30 &
++cmux_test_backend=$!
++for attempt in {1..100}; do
++  if [ "$(readlink "/proc/$cmux_test_backend/exe")" = \
++       "$TMP/home/opt/cmux-browser-nightly/cmux-tui" ]; then
++    break
++  fi
++  sleep 0.01
++done
++run_installer
++retained_exe="$(readlink "/proc/$cmux_test_backend/exe")"
++test -x "$retained_exe"
++"$retained_exe" 0
++kill "$cmux_test_backend"
++wait "$cmux_test_backend" 2>/dev/null || true
++cmux_test_backend=
++
+ if HOME="$TMP/home" \
+     CMUX_INSTALL_DIR=/ \
+     CMUX_LINUX_INSTALLER_NO_LAUNCH=1 \
+
+From 291fd20ba62c557afcd770bce8d92e4f696224b6 Mon Sep 17 00:00:00 2001
+From: Steve-Strange <120027032+Steve-Strange@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:12:08 +0800
+Subject: [PATCH 2/4] fix(linux): stabilize terminals and integrate desktop
+ input
+
+Gate unsupported direct rendering; preserve EGL display lifetime and replay existing mirrors. Correct window teardown and device scaling. Add clipboard/PRIMARY and Chromium IME integration, terminal Control chords, appearance controls, settings reuse, and terminal-only startup restoration. Include lifecycle, model, keyboard and real EGL regression coverage. Linux is validated; Windows/macOS are not.
+---
+ overlay/chrome/browser/cmux_term/BUILD.gn     |  16 +
+ .../browser/cmux_term/cmux_browser_window.cc  |   6 +
+ .../browser/cmux_term/cmux_configure_page.cc  |  47 +-
+ .../cmux_term/cmux_ghostty_opengl_host.cc     |  59 +-
+ .../cmux_ghostty_opengl_host_test.cc          |  64 ++
+ .../chrome/browser/cmux_term/cmux_keymap.cc   |  26 +-
+ .../browser/cmux_term/cmux_keymap_test.cc     |  25 +
+ .../browser/cmux_term/cmux_layout_config.cc   |   7 +
+ .../browser/cmux_term/cmux_layout_config.h    |   3 +
+ .../cmux_term/cmux_pane_extension_pins.cc     |   6 +
+ .../cmux_term/cmux_pane_extension_pins.h      |   3 +
+ .../browser/cmux_term/cmux_tab_strip.cc       |   3 +
+ .../chrome/browser/cmux_term/cmux_tab_strip.h |   1 +
+ .../cmux_term/cmux_terminal_backend.cc        |   8 +
+ .../cmux_term/cmux_terminal_pane_linux.cc     | 392 ++++++++++-
+ .../chrome/browser/cmux_term/cmux_views.cc    |  82 ++-
+ overlay/chrome/browser/cmux_term/cmux_views.h |   6 +
+ .../chrome/browser/cmux_term/window_model.cc  |  20 +
+ .../chrome/browser/cmux_term/window_model.h   |   8 +
+ .../browser/cmux_term/window_model_test.cc    |  19 +
+ scripts/run-host-tests.sh                     |   6 +
+ scripts/test-linux-terminal-lifecycle.py      | 647 ++++++++++++++++++
+ tests/linux-ghostty-lifecycle.c               | 205 ++++++
+ 23 files changed, 1588 insertions(+), 71 deletions(-)
+ create mode 100644 overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host_test.cc
+ create mode 100644 scripts/test-linux-terminal-lifecycle.py
+ create mode 100644 tests/linux-ghostty-lifecycle.c
+
+diff --git a/overlay/chrome/browser/cmux_term/BUILD.gn b/overlay/chrome/browser/cmux_term/BUILD.gn
+index d481ac1..62bf616 100644
+--- a/overlay/chrome/browser/cmux_term/BUILD.gn
++++ b/overlay/chrome/browser/cmux_term/BUILD.gn
+@@ -54,6 +54,22 @@ source_set("cmux_ghostty") {
+ # detects unresolved placeholder colors and uses the rail's neutral/config
+ # fallbacks. Do not pull //chrome/browser/ui/color:mixers into this target; it
+ # carries browser themes, UI features, task-manager, and platform dependencies.
++if (is_linux) {
++  executable("cmux_ghostty_opengl_host_test") {
++    testonly = true
++    sources = [
++      "cmux_ghostty_opengl_host.cc",
++      "cmux_ghostty_opengl_host_test.cc",
++    ]
++    deps = [ "//base" ]
++    libs = [
++      "EGL",
++      "GL",
++      "dl",
++    ]
++  }
++}
++
+ source_set("cmux_chrome_ui") {
+   sources = [
+     "cmux_easing.cc",
+diff --git a/overlay/chrome/browser/cmux_term/cmux_browser_window.cc b/overlay/chrome/browser/cmux_term/cmux_browser_window.cc
+index 38f3404..e37a8de 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_browser_window.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_browser_window.cc
+@@ -14,6 +14,7 @@
+ #include "base/logging.h"
+ #include "base/no_destructor.h"
+ #include "base/strings/string_number_conversions.h"
++#include "chrome/browser/cmux_term/cmux_pane_extension_pins.h"
+ #include "chrome/browser/cmux_term/cmux_workspace_projection.h"
+ #include "chrome/browser/ui/browser.h"
+ #include "chrome/browser/ui/bubble_anchor_util.h"
+@@ -113,6 +114,11 @@ CmuxBrowserWindow::CmuxBrowserWindow(
+ }
+ 
+ CmuxBrowserWindow::~CmuxBrowserWindow() {
++  ClearPaneExtensionPinsForBrowser(browser_);
++  // Match BrowserWidget/WebUIBrowserWindow: features such as the live-tab
++  // context hold references to this window and must release them before it
++  // is freed, even though Browser destroys its features after window_.
++  browser_->GetFeatures().TearDownPreBrowserWindowDestruction();
+   const auto existing = BrowserWindows().find(BrowserIdentity(browser_));
+   CHECK(existing != BrowserWindows().end());
+   CHECK_EQ(existing->second.get(), this);
+diff --git a/overlay/chrome/browser/cmux_term/cmux_configure_page.cc b/overlay/chrome/browser/cmux_term/cmux_configure_page.cc
+index 4bf77e5..93666b9 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_configure_page.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_configure_page.cc
+@@ -87,6 +87,14 @@ constexpr char kIndexHtml[] = R"HTML(<!doctype html>
+       <p class="muted">Choose any theme bundled with Ghostty. The terminal,
+         sidebar, tabs, toolbar, omnibox, menus, and New Tab page update
+         together. Choose “Follow Ghostty config” to use your Ghostty files.</p>
++      <div class="theme-picker">
++        <label for="ui-font-size">Interface font size (sidebar and tabs)</label>
++        <select id="ui-font-size" disabled><option value="0">System default</option></select>
++        <label for="terminal-font-size">Terminal font size</label>
++        <select id="terminal-font-size" disabled><option value="0">Ghostty default</option></select>
++      </div>
++      <p class="muted">Font sizes apply immediately and are remembered. Choose a
++        theme below to change text and background colors together.</p>
+       <div class="theme-picker">
+         <label for="ghostty-theme">Theme</label>
+         <input id="ghostty-theme" list="ghostty-theme-options"
+@@ -347,7 +355,7 @@ legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-pat
+ .theme-picker { display: grid; grid-template-columns: 1fr auto; gap: 8px 10px;
+   align-items: end; margin-top: 18px; }
+ .theme-picker label { grid-column: 1 / -1; font-size: 12px; font-weight: 650; }
+-#ghostty-theme { min-width: 0; padding: 10px 12px; border: 1px solid var(--line);
++#ghostty-theme, .theme-picker select { min-width: 0; padding: 10px 12px; border: 1px solid var(--line);
+   border-radius: 10px; color: var(--text); background: var(--bg); font: inherit; }
+ .toggle-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+   margin-top: 20px; }
+@@ -502,6 +510,15 @@ function renderPalette(palette) {
+   }
+ }
+ 
++const uiFontSize = document.querySelector('#ui-font-size');
++const terminalFontSize = document.querySelector('#terminal-font-size');
++for (const [select, minimum, maximum] of [[uiFontSize, 10, 22], [terminalFontSize, 8, 32]]) {
++  for (let size = minimum; size <= maximum; ++size) {
++    select.add(new Option(String(size), String(size)));
++  }
++  select.addEventListener('change', saveCustomization);
++}
++
+ function renderCustomization(state, includeThemes = false) {
+   if (includeThemes) {
+     themeOptions.replaceChildren();
+@@ -514,6 +531,8 @@ function renderCustomization(state, includeThemes = false) {
+   }
+   renderPalette(state.palette);
+   themePicker.value = state.theme || '';
++  uiFontSize.value = String(state.uiFontSize || 0);
++  terminalFontSize.value = String(state.terminalFontSize || 0);
+   for (const toggle of toolbarToggles) {
+     toggle.checked = Boolean(state.toolbar?.[toggle.dataset.toolbar]);
+   }
+@@ -538,6 +557,7 @@ async function saveCustomization() {
+   if (!customizationLoaded) return;
+   const generation = ++customizationSaveGeneration;
+   themePicker.disabled = true;
++  uiFontSize.disabled = terminalFontSize.disabled = true;
+   toolbarToggles.forEach(toggle => toggle.disabled = true);
+   setCustomizationStatus('Applying…');
+   setToolbarStatus('Applying…');
+@@ -545,6 +565,8 @@ async function saveCustomization() {
+     let state = await sendWithPromise('setCustomization', {
+       theme: themePicker.value.trim(),
+       toolbar: currentToolbarState(),
++      uiFontSize: Number(uiFontSize.value),
++      terminalFontSize: Number(terminalFontSize.value),
+     });
+     if (!state.ok) throw new Error(state.error || 'Could not save customization');
+     if (generation !== customizationSaveGeneration) return;
+@@ -563,6 +585,7 @@ async function saveCustomization() {
+   } finally {
+     if (generation === customizationSaveGeneration) {
+       themePicker.disabled = false;
++      uiFontSize.disabled = terminalFontSize.disabled = false;
+       toolbarToggles.forEach(toggle => toggle.disabled = false);
+     }
+   }
+@@ -574,6 +597,7 @@ async function loadCustomization() {
+   renderCustomization(state, true);
+   customizationLoaded = true;
+   themePicker.disabled = false;
++  uiFontSize.disabled = terminalFontSize.disabled = false;
+   toolbarToggles.forEach(toggle => toggle.disabled = false);
+   setCustomizationStatus(
+     state.theme ? `Using ${state.theme}.` : 'Following your Ghostty configuration.');
+@@ -641,6 +665,7 @@ document.querySelector('#show-all-toolbar').addEventListener('click', () => {
+ });
+ document.querySelector('#reset-customization').addEventListener('click', async () => {
+   themePicker.disabled = true;
++  uiFontSize.disabled = terminalFontSize.disabled = true;
+   toolbarToggles.forEach(toggle => toggle.disabled = true);
+   setCustomizationStatus('Resetting…');
+   setToolbarStatus('Resetting…');
+@@ -658,6 +683,7 @@ document.querySelector('#reset-customization').addEventListener('click', async (
+     setToolbarStatus(error.message || String(error), 'error');
+   } finally {
+     themePicker.disabled = false;
++    uiFontSize.disabled = terminalFontSize.disabled = false;
+     toolbarToggles.forEach(toggle => toggle.disabled = false);
+   }
+ });
+@@ -912,6 +938,8 @@ base::DictValue CustomizationToValue(
+   base::DictValue value;
+   value.Set("ok", true);
+   value.Set("theme", config.ghostty_theme_name);
++  value.Set("uiFontSize", config.ui_font_size);
++  value.Set("terminalFontSize", config.terminal_font_size);
+   if (themes) {
+     base::ListValue theme_values;
+     for (const std::string& theme : *themes) {
+@@ -954,6 +982,8 @@ void ResetCustomization(LayoutConfig* config) {
+     return;
+   }
+   const LayoutConfig defaults;
++  config->ui_font_size = defaults.ui_font_size;
++  config->terminal_font_size = defaults.terminal_font_size;
+   config->ghostty_theme = defaults.ghostty_theme;
+   config->ghostty_theme_name = defaults.ghostty_theme_name;
+   config->toolbar_show_back = defaults.toolbar_show_back;
+@@ -1108,12 +1138,16 @@ class CmuxConfigureHandler : public content::WebUIMessageHandler {
+     AllowJavascript();
+     LayoutConfig config =
+         GetPublishedLayoutConfig().value_or(LayoutConfig());
+-    const std::string previous_theme = config.ghostty_theme_name;
+     const base::DictValue& input = args[1].GetDict();
++    const std::optional<int> ui_font = input.FindInt("uiFontSize");
++    const std::optional<int> terminal_font = input.FindInt("terminalFontSize");
+     const std::string* theme = input.FindString("theme");
+     const base::DictValue* toolbar = input.FindDict("toolbar");
+     base::DictValue result;
+-    if (!theme || !toolbar ||
++    if (!ui_font || !terminal_font ||
++        (*ui_font != 0 && (*ui_font < 10 || *ui_font > 22)) ||
++        (*terminal_font != 0 && (*terminal_font < 8 || *terminal_font > 32)) ||
++        !theme || !toolbar ||
+         theme->find_first_of("\r\n") != std::string::npos ||
+         (!theme->empty() && *theme != config.ghostty_theme_name &&
+          !ghostty_themes_.contains(*theme)) ||
+@@ -1135,10 +1169,12 @@ class CmuxConfigureHandler : public content::WebUIMessageHandler {
+       result.Set("ok", false);
+       result.Set("error", "The customization request was invalid.");
+     } else {
++      config.ui_font_size = *ui_font;
++      config.terminal_font_size = *terminal_font;
+       config.ghostty_theme = true;
+       config.ghostty_theme_name = *theme;
+       SaveLayoutConfig(config);
+-      ReloadCustomizationConsumers(previous_theme != config.ghostty_theme_name);
++      ReloadCustomizationConsumers(true);
+       result = CustomizationToValue(config);
+     }
+     ResolveJavascriptCallback(args[0].Clone(),
+@@ -1152,10 +1188,9 @@ class CmuxConfigureHandler : public content::WebUIMessageHandler {
+     AllowJavascript();
+     LayoutConfig config =
+         GetPublishedLayoutConfig().value_or(LayoutConfig());
+-    const std::string previous_theme = config.ghostty_theme_name;
+     ResetCustomization(&config);
+     SaveLayoutConfig(config);
+-    ReloadCustomizationConsumers(previous_theme != config.ghostty_theme_name);
++    ReloadCustomizationConsumers(true);
+     ResolveJavascriptCallback(
+         args[0].Clone(),
+         base::Value(CustomizationToValue(config)));
+diff --git a/overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host.cc b/overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host.cc
+index 49307bf..1f607d4 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host.cc
+@@ -6,11 +6,14 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <limits>
++#include <map>
+ #include <utility>
+ 
+ #include "base/check.h"
+ #include "base/logging.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
+ 
+ #if BUILDFLAG(IS_LINUX)
+ #include <dlfcn.h>
+@@ -46,6 +49,49 @@ uint32_t ClampDimension(uint32_t value) {
+ 
+ #if BUILDFLAG(IS_LINUX)
+ 
++// eglInitialize is idempotent, not reference counted. All panes can receive
++// the same EGLDisplay, so terminating it when any one pane closes invalidates
++// the contexts of every other pane. Serialize initialization and termination
++// and release the connection only after its last host has gone away.
++class EGLDisplayRegistry {
++ public:
++  bool Acquire(EGLDisplay display) {
++    if (display == EGL_NO_DISPLAY) {
++      return false;
++    }
++    base::AutoLock lock(lock_);
++    auto existing = users_.find(display);
++    if (existing != users_.end()) {
++      ++existing->second;
++      return true;
++    }
++    if (eglInitialize(display, nullptr, nullptr) != EGL_TRUE) {
++      return false;
++    }
++    users_.emplace(display, 1);
++    return true;
++  }
++
++  void Release(EGLDisplay display) {
++    base::AutoLock lock(lock_);
++    auto existing = users_.find(display);
++    CHECK(existing != users_.end());
++    if (--existing->second == 0) {
++      eglTerminate(display);
++      users_.erase(existing);
++    }
++  }
++
++ private:
++  base::Lock lock_;
++  std::map<EGLDisplay, size_t> users_ GUARDED_BY(lock_);
++};
++
++EGLDisplayRegistry& GetEGLDisplayRegistry() {
++  static base::NoDestructor<EGLDisplayRegistry> registry;
++  return *registry;
++}
++
+ class LinuxOpenGLHost final : public CmuxGhosttyOpenGLHost {
+  public:
+   LinuxOpenGLHost(uint32_t width,
+@@ -64,10 +110,14 @@ class LinuxOpenGLHost final : public CmuxGhosttyOpenGLHost {
+       if (surface_ != EGL_NO_SURFACE) {
+         eglDestroySurface(display_, surface_);
+       }
+-      eglTerminate(display_);
++      GetEGLDisplayRegistry().Release(display_);
+     }
+     if (lib_gl_) {
+-      dlclose(lib_gl_);
++      // The loader can free its handle inside dlclose. Release the tracked
++      // reference first so the member does not become a dangling raw_ptr.
++      void* library = lib_gl_.get();
++      lib_gl_ = nullptr;
++      dlclose(library);
+     }
+   }
+ 
+@@ -86,15 +136,14 @@ class LinuxOpenGLHost final : public CmuxGhosttyOpenGLHost {
+                                           EGL_DEFAULT_DISPLAY),
+                                       nullptr);
+       if (display_ != EGL_NO_DISPLAY &&
+-          eglInitialize(display_, nullptr, nullptr) != EGL_TRUE) {
++          !GetEGLDisplayRegistry().Acquire(display_)) {
+         display_ = EGL_NO_DISPLAY;
+       }
+     }
+ #endif
+     if (display_ == EGL_NO_DISPLAY) {
+       display_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+-      if (display_ == EGL_NO_DISPLAY ||
+-          eglInitialize(display_, nullptr, nullptr) != EGL_TRUE) {
++      if (!GetEGLDisplayRegistry().Acquire(display_)) {
+         LOG(ERROR) << "cmux-term: unable to initialize an EGL display";
+         display_ = EGL_NO_DISPLAY;
+         return false;
+diff --git a/overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host_test.cc b/overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host_test.cc
+new file mode 100644
+index 0000000..ddf2635
+--- /dev/null
++++ b/overlay/chrome/browser/cmux_term/cmux_ghostty_opengl_host_test.cc
+@@ -0,0 +1,64 @@
++// Copyright 2026 Manaflow, Inc.
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Exercise the real Chromium adapter: closing one pane must leave the other
++// panes' EGL contexts usable, including after resizing and creating a new pane.
++#include "chrome/browser/cmux_term/cmux_ghostty_opengl_host.h"
++
++#include <EGL/egl.h>
++
++#include <array>
++#include <cstdio>
++
++#include "base/at_exit.h"
++#include "base/allocator/partition_alloc_support.h"
++#include "base/check.h"
++#include "base/command_line.h"
++#include "base/feature_list.h"
++
++namespace {
++
++void Draw(cmux::CmuxGhosttyOpenGLHost& host) {
++  ghostty_surface_config_s config = {};
++  host.PopulateSurfaceConfig(&config);
++  const auto& gl = config.platform.opengl;
++  CHECK(gl.make_current(gl.userdata))
++      << "A live pane lost its EGL context; EGL error " << eglGetError();
++  gl.swap_buffers(gl.userdata);
++  gl.clear_current(gl.userdata);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  base::AtExitManager at_exit;
++  base::CommandLine::Init(argc, argv);
++  base::allocator::PartitionAllocSupport::Get()->ReconfigureForTests();
++  base::FeatureList::InitInstance("PartitionAllocDanglingPtr", "");
++  base::allocator::PartitionAllocSupport::Get()->ReconfigureAfterFeatureListInit(
++      "");
++  for (int cycle = 0; cycle < 30; ++cycle) {
++    std::array<std::unique_ptr<cmux::CmuxGhosttyOpenGLHost>, 3> hosts;
++    for (auto& host : hosts) {
++      host = cmux::CmuxGhosttyOpenGLHost::Create(64, 64, {});
++      CHECK(host);
++      Draw(*host);
++    }
++    hosts[1].reset();
++    Draw(*hosts[0]);
++    Draw(*hosts[2]);
++    hosts[1] = cmux::CmuxGhosttyOpenGLHost::Create(64, 64, {});
++    CHECK(hosts[1]);
++    hosts[0]->SetSize(96, 80);
++    Draw(*hosts[0]);
++    Draw(*hosts[0]);
++    hosts[2].reset();
++    Draw(*hosts[0]);
++    Draw(*hosts[1]);
++    hosts[0].reset();
++    Draw(*hosts[1]);
++    hosts[1].reset();
++    std::printf("PASS OpenGL host lifecycle cycle %d\n", cycle + 1);
++  }
++  std::puts("PASS 120 real Chromium OpenGL hosts created and released");
++}
+diff --git a/overlay/chrome/browser/cmux_term/cmux_keymap.cc b/overlay/chrome/browser/cmux_term/cmux_keymap.cc
+index 4986d9f..87971d0 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_keymap.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_keymap.cc
+@@ -1470,7 +1470,15 @@ std::vector<KeyRule> DefaultKeymapRules(bool is_mac,
+           ? "alt"
+           : "mod";
+ 
+-  AddDefault(&rules, "mod+b", "sidebar.toggle");
++  // Plain Control chords belong to readline/tmux when a Linux terminal has
++  // focus. Browser chrome remains available via the explicit Ctrl+Alt chords.
++  AddDefault(&rules, "ctrl+,", "app.settings", "isLinux");
++  const char* browser_control = "!(isLinux && terminalFocused)";
++  AddDefault(&rules, "ctrl+alt+b", "tab.newWeb", "isLinux && terminalFocused");
++  AddDefault(&rules, "ctrl+alt+d", "pane.splitRight", "isLinux && terminalFocused");
++  AddDefault(&rules, "ctrl+alt+w", "tab.close", "isLinux && terminalFocused");
++  AddDefault(&rules, "ctrl+alt+l", "omnibox.focus", "isLinux && terminalFocused");
++  AddDefault(&rules, "mod+b", "sidebar.toggle", browser_control);
+   AddDefault(&rules, "mod+z", "edit.undo");
+   AddDefault(&rules, "mod+shift+z", "edit.redo");
+   AddDefault(&rules, "mod+x", "edit.cut");
+@@ -1480,7 +1488,7 @@ std::vector<KeyRule> DefaultKeymapRules(bool is_mac,
+   AddDefault(&rules, "mod+shift+n", "window.new");
+   AddDefault(&rules, "mod+shift+w", "window.close");
+   AddDefault(&rules, "mod+shift+enter", "window.toggleFullscreen");
+-  AddDefault(&rules, WithModifier(tab_modifier, "t"), "tab.newWeb");
++  AddDefault(&rules, WithModifier(tab_modifier, "t"), "tab.newWeb", browser_control);
+   if (is_mac && tab_modifier != "mod") {
+     AddDefault(&rules, "cmd+t", "tab.newWeb");
+   }
+@@ -1493,16 +1501,16 @@ std::vector<KeyRule> DefaultKeymapRules(bool is_mac,
+     AddDefault(&rules, "ctrl+shift+t", "tab.restore");
+     AddDefault(&rules, "ctrl+alt+t", "tab.newTerminal");
+   }
+-  AddDefault(&rules, "mod+d", "pane.splitRight");
++  AddDefault(&rules, "mod+d", "pane.splitRight", browser_control);
+   AddDefault(&rules, "mod+shift+d", "pane.splitDown");
+-  AddDefault(&rules, "mod+n", "column.new");
++  AddDefault(&rules, "mod+n", "column.new", browser_control);
+   AddDefault(&rules, WithModifier(workspace_modifier, "shift+m"),
+              "workspace.toggleLayout");
+-  AddDefault(&rules, WithModifier(tab_modifier, "w"), "tab.close");
+-  AddDefault(&rules, "mod+l", "omnibox.focus");
+-  AddDefault(&rules, "mod+r", "page.reload");
+-  AddDefault(&rules, "mod+[", "page.back");
+-  AddDefault(&rules, "mod+]", "page.forward");
++  AddDefault(&rules, WithModifier(tab_modifier, "w"), "tab.close", browser_control);
++  AddDefault(&rules, "mod+l", "omnibox.focus", browser_control);
++  AddDefault(&rules, "mod+r", "page.reload", browser_control);
++  AddDefault(&rules, "mod+[", "page.back", browser_control);
++  AddDefault(&rules, "mod+]", "page.forward", browser_control);
+   AddDefault(&rules, "mod+=", "zoom.in", "!terminalFocused");
+   AddDefault(&rules, "mod+plus", "zoom.in", "!terminalFocused");
+   AddDefault(&rules, "mod+-", "zoom.out", "!terminalFocused");
+diff --git a/overlay/chrome/browser/cmux_term/cmux_keymap_test.cc b/overlay/chrome/browser/cmux_term/cmux_keymap_test.cc
+index 8eeb494..1bf213f 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_keymap_test.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_keymap_test.cc
+@@ -242,6 +242,30 @@ void TestResolve() {
+   Check(!command, "zoom defaults are gated away for terminal focus");
+ }
+ 
++void TestLinuxTerminalControlKeys() {
++  Keymap keymap = DefaultKeymap(false);
++  KeyContext context;
++  context.is_linux = true;
++  context.terminal_focused = true;
++  for (const char* chord : {"ctrl+b", "ctrl+d", "ctrl+l", "ctrl+n",
++                            "ctrl+r", "ctrl+t", "ctrl+w", "ctrl+[", "ctrl+]"}) {
++    Check(!keymap.Resolve(MustParseChord(chord), context, false),
++          "Linux terminal Control chord reaches PTY");
++  }
++  auto split = keymap.Resolve(MustParseChord("ctrl+alt+d"), context, false);
++  Check(split && *split == "pane.splitRight", "explicit terminal split shortcut");
++  context.terminal_focused = false;
++  auto browser_split = keymap.Resolve(MustParseChord("ctrl+d"), context, false);
++  Check(browser_split && *browser_split == "pane.splitRight",
++        "browser Control shortcuts remain available");
++  context.terminal_focused = true;
++  KeymapLoadResult overrides = ParseKeymapJson(
++      R"({"keybindings":[{"key":"ctrl+d","command":"pane.splitRight"}]})");
++  keymap = KeymapFromConfig(false, overrides);
++  split = keymap.Resolve(MustParseChord("ctrl+d"), context, false);
++  Check(split && *split == "pane.splitRight", "explicit user binding wins");
++}
++
+ void TestModifierSchemes() {
+   using Scheme = ShortcutModifierScheme;
+ 
+@@ -524,6 +548,7 @@ int main() {
+   TestWhenParser();
+   TestResolve();
+   TestModifierSchemes();
++  TestLinuxTerminalControlKeys();
+   TestVsCodeResolution();
+   TestJson();
+   std::printf("%d checks, %d failures\n", g_checks, g_failures);
+diff --git a/overlay/chrome/browser/cmux_term/cmux_layout_config.cc b/overlay/chrome/browser/cmux_term/cmux_layout_config.cc
+index 9ff5e3e..8b268c8 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_layout_config.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_layout_config.cc
+@@ -4,6 +4,7 @@
+ #include "chrome/browser/cmux_term/cmux_layout_config.h"
+ 
+ #include <cstdlib>
++#include <algorithm>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -243,6 +244,8 @@ LayoutConfig::~LayoutConfig() = default;
+ 
+ std::string LayoutConfig::ToJson() const {
+   base::DictValue d;
++  d.Set("ui_font_size", ui_font_size);
++  d.Set("terminal_font_size", terminal_font_size);
+   d.Set("rail_width", rail_width);
+   d.Set("sidebar_icon_width",
+         sidebar_metrics::ClampIconsWidth(sidebar_icon_width));
+@@ -356,6 +359,10 @@ bool LayoutConfig::FromJson(const std::string& json, LayoutConfig* out) {
+     }
+   };
+ 
++  geti("ui_font_size", next.ui_font_size);
++  geti("terminal_font_size", next.terminal_font_size);
++  if (next.ui_font_size != 0) next.ui_font_size = std::clamp(next.ui_font_size, 10, 22);
++  if (next.terminal_font_size != 0) next.terminal_font_size = std::clamp(next.terminal_font_size, 8, 32);
+   geti("rail_width", next.rail_width);
+   geti("sidebar_icon_width", next.sidebar_icon_width);
+   next.sidebar_icon_width =
+diff --git a/overlay/chrome/browser/cmux_term/cmux_layout_config.h b/overlay/chrome/browser/cmux_term/cmux_layout_config.h
+index bd49f9a..16d5513 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_layout_config.h
++++ b/overlay/chrome/browser/cmux_term/cmux_layout_config.h
+@@ -31,6 +31,9 @@ enum class SidebarPosition {
+ // Persisted geometry for the cmux window chrome and strip. animation_ms is the
+ // global animation scale: 160ms == 1.0x bonsplit pane timing.
+ struct LayoutConfig {
++  // Zero follows the platform/Ghostty default. UI size covers sidebar and tabs.
++  int ui_font_size = 0;
++  int terminal_font_size = 0;
+   int rail_width = 200;
+   int sidebar_icon_width = sidebar_metrics::kIconsWidth;
+   int gap = 10;
+diff --git a/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.cc b/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.cc
+index b235a31..a0f80ee 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.cc
+@@ -52,6 +52,12 @@ PanePinState& StateFor(Browser* browser, PaneId pane) {
+ 
+ }  // namespace
+ 
++void ClearPaneExtensionPinsForBrowser(Browser* browser) {
++  std::erase_if(PanePinStates(), [browser](const auto& entry) {
++    return entry.first.browser == browser;
++  });
++}
++
+ void InitializePaneExtensionPins(
+     Browser* browser,
+     PaneId pane,
+diff --git a/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.h b/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.h
+index 6810515..834a761 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.h
++++ b/overlay/chrome/browser/cmux_term/cmux_pane_extension_pins.h
+@@ -15,6 +15,9 @@ class Browser;
+ 
+ namespace cmux {
+ 
++// Pins survive presentation rebuilds, but must not retain a deleted Browser.
++void ClearPaneExtensionPinsForBrowser(Browser* browser);
++
+ // Seeds a pane's pin list once from Chrome's profile-level toolbar model.
+ // Subsequent mutations are pane-local: tabs in the same pane share the list,
+ // while sibling panes in the workspace remain independent.
+diff --git a/overlay/chrome/browser/cmux_term/cmux_tab_strip.cc b/overlay/chrome/browser/cmux_term/cmux_tab_strip.cc
+index 8331dfb..22542be 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_tab_strip.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_tab_strip.cc
+@@ -558,6 +558,9 @@ class CmuxTab : public views::View, public gfx::AnimationDelegate {
+     const TabStripThemeColors& colors =
+         owner_ ? owner_->theme_colors() : fallback;
+     if (label_) {
++      const gfx::FontList font;
++      label_->SetFontList(font.DeriveWithSizeDelta(
++          colors.font_size > 0 ? colors.font_size - font.GetFontSize() : 0));
+       label_->SetEnabledColor(active_ ? colors.tab_active_text
+                                       : colors.tab_idle_text);
+     }
+diff --git a/overlay/chrome/browser/cmux_term/cmux_tab_strip.h b/overlay/chrome/browser/cmux_term/cmux_tab_strip.h
+index 72f6d4e..460170c 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_tab_strip.h
++++ b/overlay/chrome/browser/cmux_term/cmux_tab_strip.h
+@@ -60,6 +60,7 @@ inline constexpr SkColor kDefaultTabAccent = SkColorSetRGB(0x8a, 0x8f, 0x98);
+ inline constexpr SkColor kDefaultTabStripBg = SkColorSetRGB(0x17, 0x19, 0x1f);
+ 
+ struct TabStripThemeColors {
++  int font_size = 0;
+   SkColor strip_background = kDefaultTabStripBg;
+   SkColor tab_active_bg = kDefaultTabActiveBg;
+   SkColor tab_hover_bg = kDefaultTabHoverBg;
+diff --git a/overlay/chrome/browser/cmux_term/cmux_terminal_backend.cc b/overlay/chrome/browser/cmux_term/cmux_terminal_backend.cc
+index fb8c01f..fbad1c2 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_terminal_backend.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_terminal_backend.cc
+@@ -13,6 +13,7 @@
+ #include "base/memory/ref_counted.h"
+ #include "base/rand_util.h"
+ #include "base/time/time.h"
++#include "build/build_config.h"
+ 
+ namespace cmux {
+ 
+@@ -21,7 +22,9 @@ namespace {
+ constexpr base::TimeDelta kReattachDelay = base::Milliseconds(200);
+ constexpr base::TimeDelta kResizeDebounce = base::Milliseconds(100);
+ constexpr base::TimeDelta kRendererCapabilityTtl = base::Seconds(5);
++#if BUILDFLAG(IS_MAC)
+ constexpr base::TimeDelta kDirectAttachTimeout = base::Seconds(5);
++#endif
+ constexpr base::TimeDelta kDirectCancelTimeout = base::Seconds(2);
+ constexpr base::TimeDelta kDirectExitFallbackTimeout = base::Seconds(2);
+ 
+@@ -699,6 +702,10 @@ CmuxTerminalBackend::CurrentRenderableSurface() const {
+ 
+ void CmuxTerminalBackend::EnsureDirectAttached() {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  // Only the macOS frontend implements the direct terminal renderer. A failed
++  // cutover resets the compatibility attachment and requests another replay,
++  // so attempting it on Linux continually rebuilds the visible terminal.
++#if BUILDFLAG(IS_MAC)
+   const std::optional<CmuxTuiSurfaceId> surface = CurrentSurface();
+   if (closed_ || !frontend_ || frontend_suspended_ || !surface ||
+       !client_->ready() ||
+@@ -716,6 +723,7 @@ void CmuxTerminalBackend::EnsureDirectAttached() {
+   frontend_->BeginCmuxTerminalHostInputCutover(
+       attempt, base::BindOnce(&CmuxTerminalBackend::OnDirectInputCutoverReady,
+                               base::RetainedRef(this), attempt));
++#endif
+ }
+ 
+ void CmuxTerminalBackend::OnDirectInputCutoverReady(uint64_t attempt,
+diff --git a/overlay/chrome/browser/cmux_term/cmux_terminal_pane_linux.cc b/overlay/chrome/browser/cmux_term/cmux_terminal_pane_linux.cc
+index afa117a..30eccab 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_terminal_pane_linux.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_terminal_pane_linux.cc
+@@ -13,6 +13,8 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
++#include <set>
++#include <cmath>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -45,6 +47,12 @@
+ #include "chrome/browser/cmux_term/cmux_tui_protocol.h"
+ #include "chrome/browser/cmux_term/cmux_views.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
++#include "chrome/browser/ui/simple_message_box.h"
++#include "ui/base/clipboard/clipboard.h"
++#include "ui/base/clipboard/scoped_clipboard_writer.h"
++#include "ui/base/ime/input_method.h"
++#include "ui/base/ime/text_input_client.h"
++#include "ui/base/ime/text_input_flags.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+ #include "third_party/skia/include/core/SkImageInfo.h"
+ #include "third_party/skia/include/core/SkPath.h"
+@@ -58,14 +66,17 @@
+ #include "ui/events/keycodes/dom/dom_code.h"
+ #include "ui/events/keycodes/dom/keycode_converter.h"
+ #include "ui/color/color_provider.h"
++#include "ui/compositor/compositor.h"
+ #include "ui/gfx/canvas.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/geometry/skia_conversions.h"
++#include "ui/gfx/geometry/size_conversions.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/background.h"
+ #include "ui/views/border.h"
+ #include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
+ 
+ #if BUILDFLAG(IS_LINUX)
+ #include "chrome/browser/cmux_term/cmux_theme_ghostty.h"
+@@ -268,6 +279,14 @@ void TickSharedGhosttyApp() {
+ // UI-sequence only; Ghostty background threads reach it by posting through
+ // runtime.userdata's UI runner cell. cmux-tui, not this app, owns every shell.
+ ghostty_app_t g_app = nullptr;
++std::string& CurrentThemeColors() {
++  static base::NoDestructor<std::string> colors;
++  return *colors;
++}
++base::RepeatingCallbackList<void()>& ThemeCallbacks() {
++  static base::NoDestructor<base::RepeatingCallbackList<void()>> callbacks;
++  return *callbacks;
++}
+ 
+ void WakeupCb(void* userdata) {
+   // Called from a Ghostty background thread. Hop to the UI thread to tick.
+@@ -277,18 +296,10 @@ void WakeupCb(void* userdata) {
+                                 base::BindOnce(&TickSharedGhosttyApp));
+   }
+ }
+-bool ReadClipboardCb(void*, ghostty_clipboard_e, void*) {
+-  return false;
+-}
+-void ConfirmReadClipboardCb(void*,
+-                            const char*,
+-                            void*,
+-                            ghostty_clipboard_request_e) {}
+-void WriteClipboardCb(void*,
+-                      ghostty_clipboard_e,
+-                      const ghostty_clipboard_content_s*,
+-                      size_t,
+-                      bool) {}
++bool ReadClipboardCb(void*, ghostty_clipboard_e, void*);
++void ConfirmReadClipboardCb(void*, const char*, void*, ghostty_clipboard_request_e);
++void WriteClipboardCb(void*, ghostty_clipboard_e,
++                      const ghostty_clipboard_content_s*, size_t, bool);
+ bool ActionCb(ghostty_app_t, ghostty_target_s, ghostty_action_s);
+ 
+ base::SequenceChecker& AppSequenceChecker() {
+@@ -339,7 +350,8 @@ ghostty_app_t EnsureApp() {
+ 
+   ghostty_runtime_config_s rt = {};
+   rt.userdata = wakeup_runner;
+-  rt.supports_selection_clipboard = false;
++  rt.supports_selection_clipboard = ui::Clipboard::IsSupportedClipboardBuffer(
++      ui::ClipboardBuffer::kSelection);
+   rt.wakeup_cb = WakeupCb;
+   rt.action_cb = ActionCb;
+   rt.read_clipboard_cb = ReadClipboardCb;
+@@ -382,7 +394,8 @@ ghostty_input_mouse_button_e MouseButton(const ui::MouseEvent& e) {
+ 
+ class CmuxTerminalSurfaceLinux : public views::View,
+                                  public CmuxSurface,
+-                                 public CmuxTerminalBackend::Frontend {
++                                 public CmuxTerminalBackend::Frontend,
++                                 public ui::TextInputClient {
+   METADATA_HEADER(CmuxTerminalSurfaceLinux, views::View)
+ 
+  public:
+@@ -411,6 +424,11 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     }
+     backend_attached_ = true;
+     backend_->AttachFrontend(this, cols, rows);
++    layout_subscription_ = AddLayoutConfigChangedCallback(base::BindRepeating(
++        &CmuxTerminalSurfaceLinux::ApplyFontSize, weak_factory_.GetWeakPtr()));
++    theme_subscription_ = ThemeCallbacks().Add(base::BindRepeating(
++        &CmuxTerminalSurfaceLinux::ApplyThemeColors, weak_factory_.GetWeakPtr()));
++    ApplyFontSize(GetPublishedLayoutConfig().value_or(LayoutConfig()));
+   }
+ 
+   CmuxTerminalSurfaceLinux(const CmuxTerminalSurfaceLinux&) = delete;
+@@ -422,10 +440,15 @@ class CmuxTerminalSurfaceLinux : public views::View,
+       backend_->DetachFrontend(this);
+       backend_attached_ = false;
+     }
++    if (GetInputMethod()) {
++      GetInputMethod()->DetachTextInputClient(this);
++    }
++    CancelClipboardRequests();
+     mirror_retry_timer_.Stop();
+     UnregisterFromTicker();
+     StopFrameMailbox();
+     if (surface_) {
++      CancelClipboardRequests();
+       ghostty_surface_free(surface_);
+       surface_ = nullptr;
+     }
+@@ -493,7 +516,7 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     const std::vector<uint8_t> filtered =
+         StripCmuxTuiReplayPalette(base::as_string_view(replay));
+-    ReplaceMirror(filtered);
++    ReplayMirror(filtered);
+     if (colors) {
+       ApplyTerminalColors(*colors);
+     }
+@@ -566,6 +589,7 @@ class CmuxTerminalSurfaceLinux : public views::View,
+   void AddedToWidget() override {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     UpdateTickerState();
++    OnBoundsChanged(bounds());
+   }
+ 
+   void RemovedFromWidget() override {
+@@ -624,12 +648,18 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     if (b.width() <= 0 || b.height() <= 0) {
+       return;
+     }
+-    ghostty_surface_set_content_scale(surface_, 1.0, 1.0);
+-    opengl_host_->SetSize(static_cast<uint32_t>(b.width()),
+-                          static_cast<uint32_t>(b.height()));
+-    ghostty_surface_set_size(surface_, static_cast<uint32_t>(b.width()),
+-                             static_cast<uint32_t>(b.height()));
++    const float scale = ContentScale();
++    const gfx::Size pixels = gfx::ScaleToCeiledSize(b.size(), scale);
++    ghostty_surface_set_content_scale(surface_, scale, scale);
++    opengl_host_->SetSize(static_cast<uint32_t>(pixels.width()),
++                          static_cast<uint32_t>(pixels.height()));
++    ghostty_surface_set_size(surface_, static_cast<uint32_t>(pixels.width()),
++                             static_cast<uint32_t>(pixels.height()));
+     const ghostty_surface_size_s size = ghostty_surface_size(surface_);
++    VLOG(1) << "cmux-term-geometry: scale=" << scale
++            << " logical=" << b.size().ToString()
++            << " pixels=" << pixels.ToString()
++            << " cells=" << size.columns << "x" << size.rows;
+     if (backend_attached_) {
+       backend_->UpdateSize(std::max<uint16_t>(size.columns, 1),
+                            std::max<uint16_t>(size.rows, 1));
+@@ -637,6 +667,11 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     DrawSurfaceForEvent();
+   }
+ 
++  void OnDeviceScaleFactorChanged(float old_scale, float new_scale) override {
++    views::View::OnDeviceScaleFactorChanged(old_scale, new_scale);
++    OnBoundsChanged(bounds());
++  }
++
+   bool OnMousePressed(const ui::MouseEvent& e) override {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     RequestFocus();
+@@ -698,10 +733,27 @@ class CmuxTerminalSurfaceLinux : public views::View,
+   }
+ 
+   void OnKeyEvent(ui::KeyEvent* e) override {
++    if (e->key_code() == ui::VKEY_INSERT) {
++      VLOG(1) << "cmux-term: insert event code=" << static_cast<int>(e->code())
++              << " character=" << static_cast<int>(e->GetCharacter())
++              << " shift=" << e->IsShiftDown();
++    }
++    // ProcessKey is the IME's composition notification, not terminal input.
++    // Printable/control characters are delivered once through InsertChar.
++    if (e->key_code() == ui::VKEY_PROCESSKEY ||
++        (e->type() == ui::EventType::kKeyPressed && e->GetCharacter())) {
++      return;
++    }
++    SendKey(*e);
++    e->StopPropagation();
++  }
++
++  void SendKey(const ui::KeyEvent& event) {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     if (!surface_) {
+       return;
+     }
++    const ui::KeyEvent* e = &event;
+     ghostty_input_key_s k = {};
+     k.action =
+         e->type() == ui::EventType::kKeyPressed
+@@ -720,9 +772,11 @@ class CmuxTerminalSurfaceLinux : public views::View,
+       if (ch >= 0x20 && ch != 0x7f) {
+         text = base::UTF16ToUTF8(std::u16string(1, ch));
+       }
+-      // Unshifted codepoint (lowercase ASCII for letters) for binding matching.
+-      unshifted = (ch >= u'A' && ch <= u'Z') ? static_cast<uint32_t>(ch) + 32u
+-                                             : static_cast<uint32_t>(ch);
++      // GetCharacter() folds Ctrl+V to U+0016. Ghostty bindings need the
++      // printable key identity, otherwise Ctrl+Shift+C/V never match.
++      unshifted = e->GetDomKey().IsCharacter()
++                      ? e->GetDomKey().ToCharacter() : ch;
++      if (unshifted >= 'A' && unshifted <= 'Z') unshifted += 'a' - 'A';
+     }
+ #if BUILDFLAG(IS_WIN)
+     // On Windows the DomCode->native keycode does not line up with ghostty's
+@@ -760,11 +814,15 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     k.text = text.c_str();
+     k.composing = false;
+     ghostty_surface_key(surface_, k);
+-    e->SetHandled();
+   }
+ 
+   void OnFocus() override {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    views::View::OnFocus();
++    if (GetInputMethod()) {
++      GetInputMethod()->SetFocusedTextInputClient(this);
++      NotifyCaretBoundsChanged();
++    }
+     if (surface_) {
+       ghostty_surface_set_focus(surface_, true);
+       DrawSurfaceForEvent();
+@@ -775,17 +833,248 @@ class CmuxTerminalSurfaceLinux : public views::View,
+   }
+   void OnBlur() override {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (GetInputMethod()) {
++      GetInputMethod()->CancelComposition(this);
++      GetInputMethod()->DetachTextInputClient(this);
++    }
++    ClearCompositionText();
++    views::View::OnBlur();
+     if (surface_) {
+       ghostty_surface_set_focus(surface_, false);
+       DrawSurfaceForEvent();
+     }
+   }
+ 
++  // A terminal has no editable surrounding document: the PTY owns editing.
++  // Only preedit and committed text belong to this input-method client.
++  base::WeakPtr<ui::TextInputClient> AsWeakPtr() override {
++    return weak_factory_.GetWeakPtr();
++  }
++  void SetCompositionText(const ui::CompositionText& composition) override {
++    composition_ = composition.text;
++    if (surface_) {
++      const std::string text = base::UTF16ToUTF8(composition_);
++      ghostty_surface_preedit(surface_, text.data(), text.size());
++      DrawSurfaceForEvent();
++    }
++    NotifyCaretBoundsChanged();
++  }
++  size_t ConfirmCompositionText(bool) override {
++    const std::u16string text = composition_;
++    InsertText(text, InsertTextCursorBehavior::kMoveCursorAfterText);
++    return text.size();
++  }
++  void ClearCompositionText() override {
++    composition_.clear();
++    if (surface_) {
++      ghostty_surface_preedit(surface_, nullptr, 0);
++      DrawSurfaceForEvent();
++    }
++  }
++  void InsertText(const std::u16string& text, InsertTextCursorBehavior) override {
++    ClearCompositionText();
++    if (surface_ && !text.empty()) {
++      const std::string utf8 = base::UTF16ToUTF8(text);
++      // Committed IME text is typing, not bracketed clipboard paste.
++      ghostty_surface_text_input(surface_, utf8.data(), utf8.size());
++    }
++  }
++  void InsertChar(const ui::KeyEvent& event) override { SendKey(event); }
++  ui::TextInputType GetTextInputType() const override {
++    return ui::TEXT_INPUT_TYPE_TEXT;
++  }
++  ui::TextInputMode GetTextInputMode() const override {
++    return ui::TEXT_INPUT_MODE_DEFAULT;
++  }
++  base::i18n::TextDirection GetTextDirection() const override {
++    return base::i18n::LEFT_TO_RIGHT;
++  }
++  int GetTextInputFlags() const override { return ui::TEXT_INPUT_FLAG_NONE; }
++  bool CanComposeInline() const override { return true; }
++  gfx::Rect GetCaretBounds() const override {
++    double x = 0, y = 0, width = 1, height = 18;
++    if (surface_) {
++      // Ghostty returns logical coordinates (already divided by content scale).
++      ghostty_surface_ime_point(surface_, &x, &y, &width, &height);
++    }
++    gfx::Rect caret(static_cast<int>(std::floor(x)),
++                    static_cast<int>(std::floor(y - height)),
++                    std::max(1, static_cast<int>(std::ceil(width))),
++                    std::max(1, static_cast<int>(std::ceil(height))));
++    caret.Offset(GetContentsBounds().OffsetFromOrigin());
++    views::View::ConvertRectToScreen(this, &caret);
++    return caret;
++  }
++  gfx::Rect GetSelectionBoundingBox() const override { return {}; }
++  bool GetCompositionCharacterBounds(size_t index, gfx::Rect* rect) const override {
++    if (index >= composition_.size()) return false;
++    *rect = GetCaretBounds();
++    return true;
++  }
++  bool HasCompositionText() const override { return !composition_.empty(); }
++  FocusReason GetFocusReason() const override {
++    return HasFocus() ? FOCUS_REASON_OTHER : FOCUS_REASON_NONE;
++  }
++  bool GetTextRange(gfx::Range*) const override { return false; }
++  bool GetCompositionTextRange(gfx::Range*) const override { return false; }
++  bool GetEditableSelectionRange(gfx::Range*) const override { return false; }
++  bool SetEditableSelectionRange(const gfx::Range&) override { return false; }
++  bool GetTextFromRange(const gfx::Range&, std::u16string*) const override {
++    return false;
++  }
++  void OnInputMethodChanged() override { NotifyCaretBoundsChanged(); }
++  bool ChangeTextDirectionAndLayoutAlignment(base::i18n::TextDirection) override {
++    return false;
++  }
++  void ExtendSelectionAndDelete(size_t, size_t) override {}
++  void EnsureCaretNotInRect(const gfx::Rect&) override {}
++  bool IsTextEditCommandEnabled(ui::TextEditCommand) const override { return false; }
++  void SetTextEditCommandForNextKeyEvent(ui::TextEditCommand) override {}
++  ukm::SourceId GetClientSourceForMetrics() const override {
++    return ukm::kInvalidSourceId;
++  }
++  bool ShouldDoLearning() override { return false; }
++  bool SetCompositionFromExistingText(
++      const gfx::Range&, const std::vector<ui::ImeTextSpan>&) override {
++    return false;
++  }
++  void GetActiveTextInputControlLayoutBounds(
++      std::optional<gfx::Rect>* control, std::optional<gfx::Rect>* selection) override {
++    *control = GetBoundsInScreen();
++    *selection = GetCaretBounds();
++  }
++#if BUILDFLAG(IS_WIN)
++  std::optional<gfx::Rect> GetProximateCharacterBounds(const gfx::Range&) const override {
++    return std::nullopt;
++  }
++  std::optional<size_t> GetProximateCharacterIndexFromPoint(
++      const gfx::Point&, ui::IndexFromPointFlags) const override {
++    return std::nullopt;
++  }
++  void SetActiveCompositionForAccessibility(
++      const gfx::Range&, const std::u16string&, bool) override {}
++#endif
++
++  bool ReadClipboard(ghostty_clipboard_e clipboard, void* request) {
++    if (!surface_) return false;
++    const auto buffer = clipboard == GHOSTTY_CLIPBOARD_STANDARD
++                            ? ui::ClipboardBuffer::kCopyPaste
++                            : ui::ClipboardBuffer::kSelection;
++    if (!ui::Clipboard::IsSupportedClipboardBuffer(buffer)) return false;
++    VLOG(1) << "cmux-term: clipboard read buffer=" << static_cast<int>(buffer);
++    clipboard_requests_.insert(request);
++    ui::Clipboard::GetForCurrentThread()->ReadText(
++        buffer, std::nullopt,
++        base::BindOnce([](base::WeakPtr<CmuxTerminalSurfaceLinux> pane,
++                          void* request, std::u16string text) {
++          if (pane) pane->CompleteClipboard(request, base::UTF16ToUTF8(text), false);
++        }, weak_factory_.GetWeakPtr(), request));
++    return true;
++  }
++  void ConfirmClipboard(const char* text, void* request,
++                        ghostty_clipboard_request_e kind) {
++    clipboard_requests_.insert(request);
++    chrome::ShowQuestionMessageBoxAsync(
++        GetWidget() ? GetWidget()->GetNativeWindow() : gfx::NativeWindow(),
++        u"Terminal clipboard",
++        kind == GHOSTTY_CLIPBOARD_REQUEST_PASTE
++            ? u"This paste contains control characters or multiple lines that may execute commands. Paste anyway?"
++            : u"Allow the terminal application to access the system clipboard?",
++        base::BindOnce([](base::WeakPtr<CmuxTerminalSurfaceLinux> pane,
++                          void* request, std::string text, chrome::MessageBoxResult result) {
++          if (pane) pane->CompleteClipboard(request,
++              result == chrome::MESSAGE_BOX_RESULT_YES ? text : std::string(), true);
++        }, weak_factory_.GetWeakPtr(), request, std::string(text ? text : "")));
++  }
++  void WriteClipboard(ghostty_clipboard_e clipboard, std::string text, bool confirm) {
++    const auto buffer = clipboard == GHOSTTY_CLIPBOARD_STANDARD
++                            ? ui::ClipboardBuffer::kCopyPaste
++                            : ui::ClipboardBuffer::kSelection;
++    if (!ui::Clipboard::IsSupportedClipboardBuffer(buffer)) return;
++    if (confirm) {
++      chrome::ShowQuestionMessageBoxAsync(
++          GetWidget() ? GetWidget()->GetNativeWindow() : gfx::NativeWindow(),
++          u"Terminal clipboard", u"Allow the terminal application to replace the clipboard?",
++          base::BindOnce([](base::WeakPtr<CmuxTerminalSurfaceLinux> pane,
++                            ghostty_clipboard_e clipboard, std::string text,
++                            chrome::MessageBoxResult result) {
++            if (pane && result == chrome::MESSAGE_BOX_RESULT_YES)
++              pane->WriteClipboard(clipboard, std::move(text), false);
++          }, weak_factory_.GetWeakPtr(), clipboard, std::move(text)));
++      return;
++    }
++    ui::ScopedClipboardWriter writer(buffer);
++    writer.WriteText(base::UTF8ToUTF16(text));
++  }
++
+  private:
+   static constexpr uint32_t kInitW = 800;
+   static constexpr uint32_t kInitH = 600;
+   static constexpr size_t kMaxPendingMirrorOutputBytes = 16 * 1024 * 1024;
+ 
++  void ApplyFontSize(const LayoutConfig& config) {
++    if (!surface_ || applied_font_size_ == config.terminal_font_size) return;
++    applied_font_size_ = config.terminal_font_size;
++    const std::string action = config.terminal_font_size == 0
++        ? "reset_font_size" : "set_font_size:" + std::to_string(config.terminal_font_size);
++    ghostty_surface_binding_action(surface_, action.data(), action.size());
++    OnBoundsChanged(bounds());
++  }
++  void ApplyThemeColors() {
++    if (!surface_ || CurrentThemeColors().empty()) return;
++    ghostty_config_t config = ghostty_config_new();
++    if (!config) return;
++    ghostty_config_load_string(config, CurrentThemeColors().data(),
++                              CurrentThemeColors().size(), "cmux://settings/appearance");
++    ghostty_config_finalize(config);
++    ghostty_surface_update_theme_config(surface_, config);
++    ghostty_config_free(config);
++    DrawSurfaceForEvent();
++  }
++
++  void NotifyCaretBoundsChanged() {
++    if (HasFocus() && GetInputMethod()) {
++      GetInputMethod()->OnCaretBoundsChanged(this);
++    }
++  }
++  void CompleteClipboard(void* request, const std::string& text, bool confirmed) {
++    if (surface_ && clipboard_requests_.erase(request)) {
++      ghostty_surface_complete_clipboard_request(surface_, text.c_str(), request, confirmed);
++    }
++  }
++  void CancelClipboardRequests() {
++    const auto requests = clipboard_requests_;
++    for (void* request : requests) CompleteClipboard(request, std::string(), true);
++  }
++
++  float ContentScale() const {
++    const views::Widget* widget = GetWidget();
++    return widget && widget->GetCompositor()
++               ? widget->GetCompositor()->device_scale_factor()
++               : 1.0f;
++  }
++
++  void ReplayMirror(base::span<const uint8_t> replay) {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++    if (!surface_) {
++      ReplaceMirror(replay);
++      return;
++    }
++    // A snapshot replaces terminal state, not the renderer's lifetime. Reset
++    // the existing VT state before replaying it so resize/recovery does not
++    // destroy a live Ghostty surface or leave stale screen/scrollback data.
++    pending_replay_.clear();
++    pending_output_.clear();
++    awaiting_replay_ = false;
++    static constexpr char kReset[] = "\x1b" "c" "\x1b[3J";
++    ghostty_surface_process_output(surface_, kReset, sizeof(kReset) - 1);
++    if (!replay.empty()) {
++      ghostty_surface_process_output(
++          surface_, reinterpret_cast<const char*>(replay.data()), replay.size());
++    }
++    DrawSurfaceForEvent();
++  }
++
+   void ReplaceMirror(base::span<const uint8_t> replay) {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+     pending_replay_.assign(replay.begin(), replay.end());
+@@ -800,6 +1089,7 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     UnregisterFromTicker();
+     StopFrameMailbox();
+     if (surface_) {
++      CancelClipboardRequests();
+       ghostty_surface_free(surface_);
+       surface_ = nullptr;
+     }
+@@ -812,10 +1102,12 @@ class CmuxTerminalSurfaceLinux : public views::View,
+       return;
+     }
+     const gfx::Rect bounds = GetContentsBounds();
+-    const uint32_t width =
+-        bounds.width() > 0 ? static_cast<uint32_t>(bounds.width()) : kInitW;
+-    const uint32_t height =
+-        bounds.height() > 0 ? static_cast<uint32_t>(bounds.height()) : kInitH;
++    const float scale = ContentScale();
++    const gfx::Size pixels = gfx::ScaleToCeiledSize(
++        gfx::Size(bounds.width() > 0 ? bounds.width() : kInitW,
++                  bounds.height() > 0 ? bounds.height() : kInitH), scale);
++    const uint32_t width = static_cast<uint32_t>(pixels.width());
++    const uint32_t height = static_cast<uint32_t>(pixels.height());
+     frame_mailbox_ = base::MakeRefCounted<OpenGLFrameMailbox>(
+         ui_runner_, base::BindRepeating(&CmuxTerminalSurfaceLinux::OnFrame,
+                                         weak_factory_.GetWeakPtr()));
+@@ -836,7 +1128,7 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     ghostty_surface_config_s cfg = ghostty_surface_config_new();
+     cfg.userdata = this;
+     opengl_host_->PopulateSurfaceConfig(&cfg);
+-    cfg.scale_factor = 1.0;
++    cfg.scale_factor = scale;
+     cfg.font_size = 0;
+     cfg.context = GHOSTTY_SURFACE_CONTEXT_WINDOW;
+     cfg.io_mode = GHOSTTY_SURFACE_IO_MANUAL_MIRROR;
+@@ -855,9 +1147,12 @@ class CmuxTerminalSurfaceLinux : public views::View,
+       }
+       return;
+     }
+-    ghostty_surface_set_content_scale(surface_, 1.0, 1.0);
++    ghostty_surface_set_content_scale(surface_, scale, scale);
+     ghostty_surface_set_size(surface_, width, height);
+     ghostty_surface_set_focus(surface_, HasFocus());
++    applied_font_size_ = -1;
++    ApplyFontSize(GetPublishedLayoutConfig().value_or(LayoutConfig()));
++    ApplyThemeColors();
+     if (!pending_replay_.empty()) {
+       ghostty_surface_process_output(
+           surface_, reinterpret_cast<const char*>(pending_replay_.data()),
+@@ -954,6 +1249,7 @@ class CmuxTerminalSurfaceLinux : public views::View,
+     }
+     if (frame_.width() != static_cast<int>(frame.width) ||
+         frame_.height() != static_cast<int>(frame.height)) {
++      VLOG(1) << "cmux-term-frame: pixels=" << frame.width << "x" << frame.height;
+       // N32 (BGRA on little-endian) is required by gfx::ImageSkia.
+       frame_.allocPixels(SkImageInfo::Make(
+           frame.width, frame.height, kN32_SkColorType, kPremul_SkAlphaType));
+@@ -978,6 +1274,7 @@ class CmuxTerminalSurfaceLinux : public views::View,
+         return;
+       }
+     }
++    NotifyCaretBoundsChanged();
+     SchedulePaint();
+   }
+ 
+@@ -1023,6 +1320,11 @@ class CmuxTerminalSurfaceLinux : public views::View,
+   friend class SharedGhosttyTicker;
+   friend bool ActionCb(ghostty_app_t, ghostty_target_s, ghostty_action_s);
+ 
++  int applied_font_size_ = -1;
++  base::CallbackListSubscription layout_subscription_;
++  base::CallbackListSubscription theme_subscription_;
++  std::u16string composition_;
++  std::set<void*> clipboard_requests_;
+   ghostty_surface_t surface_ = nullptr;
+   std::unique_ptr<CmuxGhosttyOpenGLHost> opengl_host_;
+   scoped_refptr<OpenGLFrameMailbox> frame_mailbox_;
+@@ -1068,6 +1370,29 @@ class CmuxTerminalSurfaceLinux : public views::View,
+   friend void IoWriteCb(void* userdata, const char* bytes, uintptr_t len);
+ };
+ 
++bool ReadClipboardCb(void* userdata, ghostty_clipboard_e clipboard, void* request) {
++  auto* pane = static_cast<CmuxTerminalSurfaceLinux*>(userdata);
++  return pane && pane->ReadClipboard(clipboard, request);
++}
++void ConfirmReadClipboardCb(void* userdata, const char* text, void* request,
++                            ghostty_clipboard_request_e kind) {
++  if (auto* pane = static_cast<CmuxTerminalSurfaceLinux*>(userdata))
++    pane->ConfirmClipboard(text, request, kind);
++}
++void WriteClipboardCb(void* userdata, ghostty_clipboard_e clipboard,
++                      const ghostty_clipboard_content_s* contents, size_t count,
++                      bool confirm) {
++  auto* pane = static_cast<CmuxTerminalSurfaceLinux*>(userdata);
++  if (!pane || !contents) return;
++  const auto items = UNSAFE_BUFFERS(base::span(contents, count));
++  for (const auto& item : items) {
++    if (item.mime && item.data && std::string_view(item.mime).starts_with("text/plain")) {
++      pane->WriteClipboard(clipboard, item.data, confirm);
++      return;
++    }
++  }
++}
++
+ bool ActionCb(ghostty_app_t, ghostty_target_s target, ghostty_action_s action) {
+   if (action.tag == GHOSTTY_ACTION_RENDER &&
+       target.tag == GHOSTTY_TARGET_SURFACE) {
+@@ -1172,6 +1497,13 @@ void IoWriteCb(void* userdata, const char* bytes, uintptr_t len) {
+ 
+ }  // namespace
+ 
++#if BUILDFLAG(IS_LINUX)
++void ApplyCmuxLinuxTerminalTheme(const CmuxTheme& theme) {
++  CurrentThemeColors() = SerializeGhosttyThemeColors(theme);
++  ThemeCallbacks().Notify();
++}
++#endif
++
+ // Linux/Windows definition of the seam declared in cmux_views.h (mac's lives
+ // in cmux_views_mac.mm). Creates the OpenGL terminal frontend, parents it, and
+ // retains its independently owned cmux-tui backend.
+diff --git a/overlay/chrome/browser/cmux_term/cmux_views.cc b/overlay/chrome/browser/cmux_term/cmux_views.cc
+index 238d816..282ba77 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_views.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_views.cc
+@@ -492,6 +492,7 @@ enum class CommandAction {
+   kWorkspaceJump9,
+   kKeymapReload,
+   kThemeReload,
++  kSettingsOpen,
+   kWindowNew,
+   kWindowClose,
+   kWindowToggleFullscreen,
+@@ -561,6 +562,7 @@ constexpr CommandSpec kCommandSpecs[] = {
+     {"workspace.jump9", CommandAction::kWorkspaceJump9, false},
+     {"keymap.reload", CommandAction::kKeymapReload, false},
+     {"theme.reload", CommandAction::kThemeReload, false},
++    {"app.settings", CommandAction::kSettingsOpen, false},
+     {"window.new", CommandAction::kWindowNew, false},
+     {"window.close", CommandAction::kWindowClose, false},
+     {"window.toggleFullscreen", CommandAction::kWindowToggleFullscreen, false},
+@@ -1930,6 +1932,10 @@ class CmuxWindowView : public views::View,
+     for (PaneId pane_id : pane_ids) {
+       DestroyPaneView(pane_id, /*notify_focus=*/false);
+     }
++    // OnWindowClosing can synchronously delete the Browser-owned pages. Drop
++    // our non-owning indices before that, rather than in member destruction.
++    web_contents_by_surface_.clear();
++    web_tab_placements_.clear();
+     for (const auto& [workspace, browser] : workspace_browsers_) {
+       UnregisterCmuxBrowserWindowHost(native_window_, workspace);
+       if (browser) {
+@@ -3418,6 +3424,13 @@ class CmuxWindowView : public views::View,
+       ++pending_terminal_columns_;
+       return;
+     }
++    // Startup restoration owns an empty pane, not a placeholder web tab.
++    for (PaneId empty : model_.PanesOf(ws_)) {
++      if (model_.FindPane(ws_, empty)->tabs.empty()) {
++        NewTabInPane(empty, SurfaceKind::kTerminal);
++        return;
++      }
++    }
+     PaneId pane = model_.AddColumn(ws_, SurfaceKind::kTerminal);
+     if (pane == kInvalidId) {
+       return;
+@@ -4431,6 +4444,10 @@ class CmuxWindowView : public views::View,
+ 
+   RailConfig EffectiveRailConfig() const {
+     RailConfig config = base_rail_config_;
++    if (layout_config_.ui_font_size > 0) {
++      config.font_size = layout_config_.ui_font_size;
++      config.row_height = std::max(config.row_height, config.font_size + 12);
++    }
+     if (SidebarOnRight()) {
+       // macOS window controls remain on the left edge; a right-hand rail does
+       // not need their reserved header width.
+@@ -4566,6 +4583,7 @@ class CmuxWindowView : public views::View,
+       pane_theme_colors_.idle_border = SkColorFromThemeArgb(p.pane_idle_border);
+     }
+ 
++    tab_theme_colors_.font_size = layout_config_.ui_font_size;
+     tab_theme_colors_.accent = EffectiveAccentColor();
+     pane_theme_colors_.focus_border = EffectiveFocusColor();
+     SetCmuxChromeSurfaceColors(chrome_surface_colors_);
+@@ -4697,6 +4715,9 @@ class CmuxWindowView : public views::View,
+     }
+     const bool enabled = GhosttyThemeEnabled();
+     if (enabled && theme.has_value()) {
++#if BUILDFLAG(IS_LINUX)
++      ApplyCmuxLinuxTerminalTheme(*theme);
++#endif
+       active_theme_palette_ = DeriveUiPalette(*theme);
+       active_theme_name_ = layout_config_.ghostty_theme_name;
+     } else {
+@@ -5045,7 +5066,8 @@ class CmuxWindowView : public views::View,
+     const SkColor accent_color = EffectiveAccentColor();
+     const SkColor drop_highlight_color = EffectiveDropHighlightColor();
+     const SkColor focus_color = EffectiveFocusColor();
+-    if (applied_rail_header_height_ != header_height ||
++    if (applied_ui_font_size_ != layout_config_.ui_font_size ||
++        applied_rail_header_height_ != header_height ||
+         applied_sidebar_position_ != layout_config_.sidebar_position ||
+         applied_animations_ != animations ||
+         applied_animation_ms_ != animation_ms ||
+@@ -5065,6 +5087,7 @@ class CmuxWindowView : public views::View,
+       for (auto& kv : views_) {
+         ApplyAnimationConfigToPane(kv.second);
+       }
++      applied_ui_font_size_ = layout_config_.ui_font_size;
+       applied_rail_header_height_ = header_height;
+       applied_sidebar_position_ = layout_config_.sidebar_position;
+       applied_animations_ = animations;
+@@ -5391,7 +5414,8 @@ class CmuxWindowView : public views::View,
+   void NewTabInPane(PaneId pane_id,
+                     SurfaceKind kind,
+                     std::string terminal_command = std::string(),
+-                    std::string title = std::string()) {
++                    std::string title = std::string(),
++                    GURL web_url = GURL()) {
+     CmuxPaneView* view = ViewForPane(pane_id);
+     if (!view) {
+       return;
+@@ -5400,7 +5424,7 @@ class CmuxWindowView : public views::View,
+     if (tab == kInvalidId) {
+       return;
+     }
+-    CreateSurfaceForTab(view, tab, kind, GURL(), terminal_command);
++    CreateSurfaceForTab(view, tab, kind, web_url, terminal_command);
+     RefreshPaneTabs(pane_id);
+     if (kind == SurfaceKind::kWeb) {
+       FocusNewWebTab(pane_id, tab);
+@@ -6246,11 +6270,6 @@ class CmuxWindowView : public views::View,
+     }
+     const WorkspaceId workspace = location->first;
+     const PaneId pane_id = location->second;
+-    if (!EnsureWebFallbackForTerminal(pane_id, tab)) {
+-      LOG(ERROR) << "cmux-views: canonical terminal removal could not create "
+-                    "a web fallback";
+-      return;
+-    }
+     CmuxPaneView* view = ViewForPane(pane_id);
+     if (view) {
+       view->RemoveSurface(tab);
+@@ -6259,7 +6278,7 @@ class CmuxWindowView : public views::View,
+     // Canonical Remove is projection-only. Never call backend->Close(): the
+     // registry has already committed the tombstone/absence.
+     terminal_backends_.erase(backend_it);
+-    model_.CloseTab(workspace, pane_id, tab);
++    model_.RemoveProjectedTab(workspace, pane_id, tab);
+     if (model_.FindPane(workspace, pane_id)) {
+       RefreshPaneTabs(pane_id);
+       if (workspace == ws_) {
+@@ -6937,6 +6956,24 @@ class CmuxWindowView : public views::View,
+       case CommandAction::kKeymapReload:
+         ReloadKeymap();
+         return true;
++      case CommandAction::kSettingsOpen: {
++        for (PaneId pane_id : model_.PanesOf(ws_)) {
++          const Pane* pane = model_.FindPane(ws_, pane_id);
++          for (const SurfaceTab& tab : pane->tabs) {
++            content::WebContents* contents = WebContentsForSurface(tab.id);
++            if (contents && (contents->GetVisibleURL().host() == "cmux-configure" ||
++                contents->GetVisibleURL() == GURL("cmux://settings/"))) {
++              model_.SelectTab(ws_, pane_id, tab.id);
++              RefreshPaneTabs(pane_id);
++              focus_.FocusPane(pane_id, /*move_keyboard=*/true);
++              return true;
++            }
++          }
++        }
++        NewTabInPane(FocusedPane(), SurfaceKind::kWeb, std::string(),
++                     std::string(), GURL("cmux://settings/"));
++        return true;
++      }
+       case CommandAction::kThemeReload:
+         ReloadTheme();
+         return true;
+@@ -7263,7 +7300,7 @@ class CmuxWindowView : public views::View,
+ 
+  public:
+   void InitializeStartupTab(const std::optional<GURL>& startup_url) {
+-    pending_startup_tab_ = true;
++    pending_startup_tab_ = startup_url.has_value();
+     pending_startup_url_ = startup_url;
+     RunPendingStartupContentIfReady();
+   }
+@@ -7295,7 +7332,12 @@ class CmuxWindowView : public views::View,
+       }
+     }
+     if (!pane || !tab || tab->kind != SurfaceKind::kWeb) {
+-      return;
++      if (startup_url && startup_url->is_valid()) {
++        NewTab(SurfaceKind::kWeb);
++        pane = model_.FindPane(ws_, FocusedPane());
++        tab = pane ? pane->FindTab(pane->selected) : nullptr;
++      }
++      if (!pane || !tab || tab->kind != SurfaceKind::kWeb) return;
+     }
+     if (startup_url && startup_url->is_valid() && !startup_url->is_empty()) {
+       if (content::WebContents* contents = WebContentsForSurface(tab->id)) {
+@@ -9409,8 +9451,8 @@ class CmuxWindowView : public views::View,
+     // workspace below is materialized from a canonical UUID.
+     if (!registry_bootstrapped_ && snapshot.workspaces.empty() &&
+         model_.workspace_count() == 0) {
+-      const WorkspaceId home = model_.AddWorkspace(
+-          SurfaceKind::kWeb, "Home", NewWorkspaceRegistryKey());
++      const WorkspaceId home = model_.AddEmptyWorkspace(
++          "Home", NewWorkspaceRegistryKey());
+       CHECK_NE(home, kInvalidId);
+       pending_workspace_mutations_.RememberCreate(
+           WorkspaceRegistryKey(home), NewWorkspaceMutationId());
+@@ -9418,10 +9460,7 @@ class CmuxWindowView : public views::View,
+       ws_ = home;
+       model_.SelectWorkspace(home);
+       EnsureActivePanesRealized();
+-      // Seed one terminal only for a confirmed brand-new registry. On every
+-      // later launch the canonical terminal registry is authoritative; an
+-      // unconditional startup column would create another durable terminal on
+-      // each restart and make Browser a second lifecycle writer.
++      // Wait for workspace registration before creating its first terminal.
+       pending_terminal_columns_ = 1;
+     }
+     registry_bootstrapped_ = true;
+@@ -9439,7 +9478,7 @@ class CmuxWindowView : public views::View,
+     for (const CmuxCanonicalWorkspace& remote : plan.materialize) {
+       if (!model_.FindWorkspaceByRegistryKey(remote.key)) {
+         const WorkspaceId added =
+-            model_.AddWorkspace(SurfaceKind::kWeb, remote.name, remote.key);
++            model_.AddEmptyWorkspace(remote.name, remote.key);
+         CHECK(native_window_registry_->RegisterWorkspace(
+             WorkspaceLocator{native_window_, added}));
+         CreateBrowserForWorkspace(added);
+@@ -9995,6 +10034,7 @@ class CmuxWindowView : public views::View,
+   std::optional<base::SequenceBound<base::FilePathWatcher>>
+       keymap_file_watcher_;
+   base::OneShotTimer keymap_reload_timer_;
++  int applied_ui_font_size_ = -1;
+   RailConfig base_rail_config_;
+   std::optional<CmuxThemePalette> active_theme_palette_;
+   // Theme name captured at the same moment as active_theme_palette_. The
+@@ -10322,9 +10362,9 @@ class CmuxWidgetDestroyObserver : public views::WidgetObserver {
+     }
+     widget->RemoveObserver(this);
+     ClearViewsWindowStateForWidget(widget);
+-    if (NativeWindows().empty()) {
+-      DestroyCmuxExtensionsContainer();
+-    }
++    // The root view has not been destroyed yet. Its extension strips, action
++    // models, and menu buttons still reference their Browser's container.
++    // CmuxWindowView releases each container after destroying those children.
+   }
+ 
+   void OnWidgetActivationChanged(views::Widget* widget, bool active) override {
+diff --git a/overlay/chrome/browser/cmux_term/cmux_views.h b/overlay/chrome/browser/cmux_term/cmux_views.h
+index d376772..8b0f46b 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_views.h
++++ b/overlay/chrome/browser/cmux_term/cmux_views.h
+@@ -8,6 +8,7 @@
+ #include <string>
+ 
+ #include "base/memory/scoped_refptr.h"
++#include "build/build_config.h"
+ #include "chrome/browser/cmux_term/cmux_keymap.h"
+ #include "chrome/browser/cmux_term/cmux_theme.h"
+ 
+@@ -36,6 +37,11 @@ class MouseEvent;
+ }
+ 
+ namespace cmux {
++#if BUILDFLAG(IS_LINUX)
++struct CmuxTheme;
++void ApplyCmuxLinuxTerminalTheme(const CmuxTheme& theme);
++#endif
++
+ 
+ class CmuxStripController;
+ class CmuxSurface;
+diff --git a/overlay/chrome/browser/cmux_term/window_model.cc b/overlay/chrome/browser/cmux_term/window_model.cc
+index 7b3d2e8..bf64bcc 100644
+--- a/overlay/chrome/browser/cmux_term/window_model.cc
++++ b/overlay/chrome/browser/cmux_term/window_model.cc
+@@ -354,6 +354,14 @@ WorkspaceId WindowModel::AddWorkspace(SurfaceKind first_tab_kind,
+   return AddChildWorkspace(kInvalidId, first_tab_kind, title, registry_key);
+ }
+ 
++WorkspaceId WindowModel::AddEmptyWorkspace(const std::string& title,
++                                           const std::string& registry_key) {
++  const WorkspaceId workspace = AddWorkspace(SurfaceKind::kWeb, title, registry_key);
++  Pane* pane = FindPane(workspace, PanesOf(workspace).front());
++  RemoveProjectedTab(workspace, pane->id, pane->selected);
++  return workspace;
++}
++
+ WorkspaceId WindowModel::AddChildWorkspace(WorkspaceId parent,
+                                            SurfaceKind first_tab_kind,
+                                            const std::string& title,
+@@ -1451,6 +1459,18 @@ void WindowModel::CloseTab(WorkspaceId workspace,
+   }
+ }
+ 
++void WindowModel::RemoveProjectedTab(WorkspaceId workspace, PaneId pane,
++                                     SurfaceTabId tab) {
++  Pane* p = FindPane(workspace, pane);
++  if (p && p->tabs.size() == 1 && p->tabs.front().id == tab &&
++      PanesOf(workspace).size() == 1) {
++    p->tabs.clear();
++    p->selected = kInvalidId;
++    return;
++  }
++  CloseTab(workspace, pane, tab);
++}
++
+ void WindowModel::SelectTab(WorkspaceId workspace,
+                             PaneId pane,
+                             SurfaceTabId tab) {
+diff --git a/overlay/chrome/browser/cmux_term/window_model.h b/overlay/chrome/browser/cmux_term/window_model.h
+index 27594e0..be91f64 100644
+--- a/overlay/chrome/browser/cmux_term/window_model.h
++++ b/overlay/chrome/browser/cmux_term/window_model.h
+@@ -248,6 +248,10 @@ class WindowModel {
+   WorkspaceId AddWorkspace(SurfaceKind first_tab_kind = SurfaceKind::kWeb,
+                            const std::string& title = {},
+                            const std::string& registry_key = {});
++  // Registry restoration has no default web tab. Keep one empty pane until
++  // canonical terminals (or an explicit user-created tab) arrive.
++  WorkspaceId AddEmptyWorkspace(const std::string& title,
++                                const std::string& registry_key);
+   // Compatibility helper for callers that add a workspace "under" another:
+   // the parent and new workspace are placed in the same shallow group. If the
+   // parent is already grouped, the new workspace is appended to that group.
+@@ -403,6 +407,10 @@ class WindowModel {
+   // on that pane. If that pane is the workspace's only pane, no-op so every
+   // pane remains non-empty.
+   void CloseTab(WorkspaceId workspace, PaneId pane, SurfaceTabId tab);
++  // Projection removal must not invent a persistent tab when the final
++  // terminal is being rebound. Unlike explicit CloseTab, allow the last pane
++  // to remain empty; the workspace identity and its placement survive.
++  void RemoveProjectedTab(WorkspaceId workspace, PaneId pane, SurfaceTabId tab);
+   void SelectTab(WorkspaceId workspace, PaneId pane, SurfaceTabId tab);
+   bool SetTabLoading(WorkspaceId workspace,
+                      PaneId pane,
+diff --git a/overlay/chrome/browser/cmux_term/window_model_test.cc b/overlay/chrome/browser/cmux_term/window_model_test.cc
+index de35602..cace385 100644
+--- a/overlay/chrome/browser/cmux_term/window_model_test.cc
++++ b/overlay/chrome/browser/cmux_term/window_model_test.cc
+@@ -1773,7 +1773,26 @@ void TestWorkspaceLayoutMode() {
+ 
+ }  // namespace
+ 
++void TestEmptyRegistryRestoration() {
++  WindowModel model;
++  const auto workspace = model.AddEmptyWorkspace("Restored", "registry-key");
++  const auto pane = model.PanesOf(workspace).front();
++  Check(model.FindPane(workspace, pane)->tabs.empty(), "restore has no default web tab");
++  const auto terminal = model.AddTab(workspace, pane, SurfaceKind::kTerminal);
++  model.RemoveProjectedTab(workspace, pane, terminal);
++  Check(model.PanesOf(workspace).size() == 1 &&
++            model.FindPane(workspace, pane)->tabs.empty(),
++        "terminal rebind keeps an empty pane without a web fallback");
++  const auto restored = model.AddTab(workspace, pane, SurfaceKind::kTerminal);
++  Check(model.FindPane(workspace, pane)->selected == restored,
++        "canonical terminal fills the restored pane");
++  model.CloseTab(workspace, pane, restored);
++  Check(model.FindPane(workspace, pane)->tabs.size() == 1,
++        "explicit close retains its existing final-pane invariant");
++}
++
+ int main() {
++  TestEmptyRegistryRestoration();
+   std::printf("window_model_test\n");
+   TestWorkspaceLifecycle();
+   TestDuplicateWorkspace();
+diff --git a/scripts/run-host-tests.sh b/scripts/run-host-tests.sh
+index 21be0f0..e391a4d 100755
+--- a/scripts/run-host-tests.sh
++++ b/scripts/run-host-tests.sh
+@@ -209,6 +209,12 @@ shopt -u nullglob
+ 
+ for path in "${discovered[@]}"; do
+   test="$(basename "$path")"
++  if [ "$test" = "cmux_ghostty_opengl_host_test.cc" ]; then
++    # This regression uses the real Chromium adapter and PartitionAlloc. It
++    # belongs to the GN test target, not the standalone pure-model compiler.
++    echo "Chromium integration test: run ninja -C out/Release cmux_ghostty_opengl_host_test separately"
++    continue
++  fi
+   if ! is_known_test "$test"; then
+     echo "ERROR: host test is not covered by scripts/run-host-tests.sh: $path" >&2
+     exit 1
+diff --git a/scripts/test-linux-terminal-lifecycle.py b/scripts/test-linux-terminal-lifecycle.py
+new file mode 100644
+index 0000000..39a3cd6
+--- /dev/null
++++ b/scripts/test-linux-terminal-lifecycle.py
+@@ -0,0 +1,647 @@
++#!/usr/bin/env python3
++"""Exercise the real Linux browser in an isolated X server and backend session."""
++
++import argparse
++import base64
++import importlib.util
++import json
++import math
++import os
++from pathlib import Path
++import re
++import select
++import signal
++import subprocess
++import sys
++import tempfile
++import shlex
++import urllib.request
++import time
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--browser", type=Path, required=True)
++    parser.add_argument("--backend", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--hold-seconds", type=float, default=60)
++    parser.add_argument("--cycles", type=int, default=10)
++    parser.add_argument("--record-seconds", type=float, default=0,
++                        help="Record the isolated Xvfb display during steady state")
++    parser.add_argument("--ffmpeg", default="ffmpeg",
++                        help="FFmpeg executable with X11 capture and libx264 support")
++    parser.add_argument("--display", help="Use an existing X display instead of Xvfb")
++    parser.add_argument("--toolkit", choices=("qt", "gtk", "native"), default="qt")
++    parser.add_argument("--native-rendering", action="store_true",
++                        help="Use the system's normal graphics configuration")
++    parser.add_argument("--scale", type=float,
++                        help="Force Chromium device scale for HiDPI regression")
++    parser.add_argument("--input-checks", action="store_true",
++                        help="Test clipboard, appearance settings, and same-session restart")
++    parser.add_argument("--ime-check", action="store_true",
++                        help="Test the current desktop's fcitx Sogou input in this test window")
++    parser.add_argument("--ime-toggle-shift", action="store_true",
++                        help="Sogou starts in English mode; toggle Shift before typing and restore it")
++    args = parser.parse_args()
++    if args.ime_check and (not args.display or not args.input_checks):
++        parser.error("--ime-check requires --display and --input-checks")
++    if args.cycles < 1 or args.hold_seconds < 0 or args.record_seconds < 0:
++        parser.error("cycles must be positive and durations must be nonnegative")
++    if args.display and args.record_seconds:
++        parser.error("recording is limited to this test's isolated Xvfb display")
++    if args.scale is not None and (not math.isfinite(args.scale) or args.scale < 1):
++        parser.error("scale must be finite and at least 1")
++    out = args.output.resolve()
++    out.mkdir(parents=True, exist_ok=False)
++    support_path = Path(__file__).with_name("smoke-cmux-tui-backend.py")
++    spec = importlib.util.spec_from_file_location("cmux_backend_smoke", support_path)
++    support = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = support
++    spec.loader.exec_module(support)
++    env = os.environ.copy()
++    ime_env = {**env, "DISPLAY": args.display} if args.ime_check else env
++    if args.ime_check:
++        # Fcitx 4 locates its private D-Bus address through XDG_CONFIG_HOME.
++        # Resolve it before isolating the browser's config below.
++        env["FCITX_DBUS_ADDRESS"] = subprocess.check_output(
++            ["fcitx-remote", "-a"], env=ime_env,
++            text=True, timeout=5).strip()
++    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "QT_PLUGIN_PATH",
++                "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_PLATFORM",
++                "GHOSTTY_RESOURCES_DIR",
++                "__EGL_VENDOR_LIBRARY_FILENAMES", "LIBGL_ALWAYS_SOFTWARE",
++                "GALLIUM_DRIVER", "LP_NUM_THREADS"):
++        env.pop(key, None)
++    runtime = Path(tempfile.mkdtemp(prefix="cmux-test-", dir=env.get("XDG_RUNTIME_DIR", "/tmp")))
++    socket_path = runtime / "control.sock"
++    for name in ("state", "config", "cache"):
++        (out / name).mkdir()
++        env["XDG_" + name.upper() + "_HOME"] = str(out / name)
++    config = out / "cmux.json"
++    config.write_text(json.dumps({
++        "app": {"sendAnonymousTelemetry": False},
++        "keybindings": [
++            {"key": "f8", "command": "tab.newTerminal", "args": {
++                "command": "exec /bin/bash --noprofile --norc", "title": "Lifecycle test"}},
++            {"key": "f9", "command": "tab.close"},
++            {"key": "f10", "command": "window.close"}]}))
++    env.update(CMUX_LAYOUT_CONFIG=str(out / "layout.json"),
++               CMUX_CONFIG=str(config), CMUX_TELEMETRY_ENABLE="0",
++               CMUX_TUI_SESSION=runtime.name, CMUX_TUI_SOCKET=str(socket_path),
++               CMUX_TUI_BINARY=str(args.backend.resolve()), CMUX_TAG=runtime.name,
++               HISTFILE="/dev/null")
++    # Keep the default startup zsh from reading personal startup commands.
++    zsh_config = out / "config/zsh"
++    zsh_config.mkdir()
++    # An empty startup directory triggers zsh-newuser-install and consumes
++    # the first command as a wizard response instead of executing it.
++    (zsh_config / ".zshrc").write_text("# Isolated lifecycle-test shell.\n")
++    env["ZDOTDIR"] = str(zsh_config)
++    if not args.native_rendering:
++        env.update(__EGL_VENDOR_LIBRARY_FILENAMES="/usr/share/glvnd/egl_vendor.d/50_mesa.json",
++                   LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe", LP_NUM_THREADS="4")
++    processes, files = [], []
++    client, browser = None, None
++    result = {"browser": str(args.browser.resolve()), "backend": str(args.backend.resolve()),
++              "runtime": str(runtime), "passed": False, "operations": [],
++              "toolkit": args.toolkit, "native_rendering": args.native_rendering,
++              "external_display": args.display, "cycles": args.cycles,
++              "hold_seconds": args.hold_seconds, "record_seconds": args.record_seconds}
++    started = time.monotonic()
++    original_clipboard = None
++    original_selection = None
++    original_ime_state = None
++    clipboard_owners = []
++
++    def launch(command, log, **kwargs):
++        stream = (out / log).open("w")
++        files.append(stream)
++        process = subprocess.Popen(command, env=env, stdout=stream, stderr=subprocess.STDOUT,
++                                   stdin=subprocess.DEVNULL, start_new_session=True, **kwargs)
++        processes.append(process)
++        return process
++
++    def wait_for(check, description, timeout=10):
++        deadline = time.monotonic() + timeout
++        while time.monotonic() < deadline:
++            if browser is not None and browser.poll() is not None:
++                raise RuntimeError(f"browser exited {browser.returncode} during {description}")
++            value = check()
++            if value:
++                return value
++            time.sleep(0.1)
++        raise RuntimeError("timed out: " + description)
++
++    def xdo(*command):
++        return subprocess.check_output(["xdotool", *map(str, command)], env=env,
++                                       text=True, stderr=subprocess.DEVNULL).strip()
++
++    def close_window(window):
++        if args.display:
++            subprocess.run(["wmctrl", "-ic", hex(int(window))], env=env, check=True)
++            return "window-manager EWMH close request"
++        # Xvfb has no window manager. Send the standard graceful close protocol
++        # directly; F10 is a platform menu key and depends on focus/toolkit.
++        import ctypes as ct
++        class ClientMessage(ct.Structure):
++            _fields_ = [("type", ct.c_int), ("serial", ct.c_ulong),
++                        ("send_event", ct.c_int), ("display", ct.c_void_p),
++                        ("window", ct.c_ulong), ("message_type", ct.c_ulong),
++                        ("format", ct.c_int), ("data", ct.c_long * 5)]
++        class Event(ct.Union):
++            _fields_ = [("message", ClientMessage), ("pad", ct.c_long * 24)]
++        x11 = ct.CDLL("libX11.so.6")
++        x11.XOpenDisplay.argtypes, x11.XOpenDisplay.restype = [ct.c_char_p], ct.c_void_p
++        x11.XInternAtom.argtypes = [ct.c_void_p, ct.c_char_p, ct.c_int]
++        x11.XInternAtom.restype = ct.c_ulong
++        x11.XSendEvent.argtypes = [ct.c_void_p, ct.c_ulong, ct.c_int, ct.c_long, ct.POINTER(Event)]
++        x11.XCloseDisplay.argtypes = [ct.c_void_p]
++        display = x11.XOpenDisplay(env["DISPLAY"].encode())
++        if not display:
++            raise RuntimeError("cannot connect to test display for graceful close")
++        try:
++            event = Event()
++            event.message = ClientMessage(33, 0, 1, display, int(window),
++                x11.XInternAtom(display, b"WM_PROTOCOLS", 0), 32,
++                (ct.c_long * 5)(x11.XInternAtom(display, b"WM_DELETE_WINDOW", 0), 0, 0, 0, 0))
++            if not x11.XSendEvent(display, int(window), 0, 0, ct.byref(event)):
++                raise RuntimeError("WM_DELETE_WINDOW could not be sent")
++        finally:
++            x11.XCloseDisplay(display)
++        return "WM_DELETE_WINDOW (isolated Xvfb)"
++
++    try:
++        if args.display:
++            env["DISPLAY"] = args.display
++        else:
++            reader, writer = os.pipe()
++            try:
++                launch(["Xvfb", "-displayfd", str(writer), "-screen", "0", "1280x900x24",
++                        "-nolisten", "tcp"], "xvfb.log", pass_fds=(writer,))
++                os.close(writer)
++                writer = None
++                if not select.select([reader], [], [], 10)[0]:
++                    raise RuntimeError("Xvfb did not allocate a display")
++                env["DISPLAY"] = ":" + os.read(reader, 40).decode().strip()
++            finally:
++                os.close(reader)
++                if writer is not None:
++                    os.close(writer)
++        launch([str(args.backend.resolve()), "--headless", "--socket",
++                str(socket_path), "--state", str(out / "state"), "--session", runtime.name],
++               "backend.log")
++        wait_for(socket_path.exists, "isolated backend")
++        client = support.JsonLineClient(socket_path, 5)
++        flags = ["--user-data-dir=" + str(out / "profile"), "--no-first-run",
++                 "--no-default-browser-check", "--ozone-platform=x11",
++                 "--enable-logging=stderr", "--window-size=1280,900",
++                 "--vmodule=cmux_terminal_backend=1,cmux_terminal_pane_linux=1,cmux_views=1"]
++        if args.toolkit != "native":
++            flags.append("--ui-toolkit=" + args.toolkit)
++        if args.scale is not None:
++            flags.append("--force-device-scale-factor=" + str(args.scale))
++        if not args.native_rendering:
++            flags.append("--disable-gpu")
++        if args.input_checks:
++            flags.append("--remote-debugging-port=0")
++        if args.ime_check:
++            env.update(GTK_IM_MODULE="fcitx", QT_IM_MODULE="fcitx", XMODIFIERS="@im=fcitx")
++        result["flags"] = flags
++        browser = launch([str(args.browser.resolve()), *flags], "browser.log")
++
++        def windows():
++            try:
++                # Chromium's ordinary BrowserView and helper windows can share
++                # this PID. Only the cmux window carries our unique build tag.
++                return xdo("search", "--all", "--onlyvisible", "--pid", browser.pid,
++                           "--name", "^cmux.*" + runtime.name + "$").splitlines()
++            except subprocess.CalledProcessError:
++                return []
++
++        window = wait_for(windows, "browser window")[-1]
++        xdo("windowfocus", "--sync", window)
++
++        def terminals():
++            return client.request("list-terminals")[0]["terminals"]
++
++        def key(keyname, expected):
++            nonlocal window
++            # Chromium may replace its startup window with the cmux window.
++            # Resolve a live window again and keep events scoped to this app.
++            window = wait_for(windows, "current browser window")[-1]
++            xdo("windowfocus", "--sync", window)
++            try:
++                xdo("key", "--window", window, keyname)
++            except subprocess.CalledProcessError:
++                # The key can close/replace its target before X sends KeyUp.
++                # The backend count below verifies whether it took effect.
++                pass
++            wait_for(lambda: len(terminals()) == expected, f"{keyname}: {expected} terminals")
++            time.sleep(0.25)
++            result["operations"].append({"key": keyname, "terminals": expected,
++                                           "elapsed_s": round(time.monotonic() - started, 3)})
++
++        # A brand-new canonical registry asynchronously seeds one terminal.
++        # Starting shortcuts before that races the startup column/focus and
++        # makes terminal counts depend on scheduling rather than the action.
++        wait_for(lambda: len(terminals()) == 1, "startup terminal", timeout=20)
++        wait_for(lambda: "cmux-keymap: loaded 3 user rules" in
++                 (out / "browser.log").read_text(errors="replace"),
++                 "configured shortcuts")
++        time.sleep(0.5)
++        result["startup_terminals"] = len(terminals())
++        if args.input_checks:
++            debug_file = out / "profile/DevToolsActivePort"
++            wait_for(debug_file.exists, "debug endpoint")
++            def targets():
++                port = int(debug_file.read_text().splitlines()[0])
++                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++                with opener.open(f"http://127.0.0.1:{port}/json/list", timeout=3) as reply:
++                    return json.load(reply)
++            def page_targets():
++                return [t for t in targets() if t["type"] == "page"]
++            result["startup_web_pages"] = [t["url"] for t in page_targets()]
++        for count in range(2, 5):
++            key("F8", count)
++        def check_shell(terminal, marker):
++            identity = terminal["terminal_id"]
++            resolved = wait_for(lambda: client.request("resolve-terminal", terminal_id=identity)[0]
++                                .get("surface"), "running terminal")
++            result["shell_probe"] = {"terminal_id": identity, "surface": resolved,
++                                     "marker": marker}
++            command = f"printf '%s\\n' '{marker}'\n"
++            client.request("send", surface=resolved,
++                           bytes=base64.b64encode(command.encode()).decode())
++            wait_for(lambda: marker in (line.rstrip() for line in client.request(
++                "read-screen", surface=resolved)[0].get("text", "").splitlines()),
++                     "shell output")
++
++        for index, terminal in enumerate(terminals()):
++            check_shell(terminal, f"CMUX_SMOKE_{index}")
++        # Backend readiness can precede Chromium's startup focus changes.
++        # Click inside the visible terminal, as a user would, before testing
++        # its shortcuts; setting X focus alone does not select a Views child.
++        window = wait_for(windows, "terminal focus window")[-1]
++        xdo("mousemove", "--window", window, 400, 300)
++        xdo("click", "--window", window, 1)
++        time.sleep(0.5)
++        for cycle in range(args.cycles):
++            key("F9", 3)
++            survivors = {t["terminal_id"] for t in terminals()}
++            key("F8", 4)
++            created = [t for t in terminals() if t["terminal_id"] not in survivors]
++            if len(created) != 1:
++                raise RuntimeError("new terminal identity was not unique")
++            check_shell(created[0], f"CMUX_SMOKE_REPLACED_{cycle}")
++            xdo("windowsize", window, 1100 if cycle % 2 else 1280,
++                760 if cycle % 2 else 900)
++        # Also exercise keyboard input through the visible frontend. Backend
++        # shell output alone does not prove the terminal view accepts input.
++        surface = client.request("resolve-terminal", terminal_id=created[0]["terminal_id"])[0]["surface"]
++        window = wait_for(windows, "keyboard target window")[-1]
++        xdo("windowfocus", "--sync", window)
++        # Let the last X resize and debounced PTY geometry update complete.
++        # Keep this command short enough for a high-DPI terminal's narrow grid.
++        time.sleep(0.5)
++        xdo("type", "--window", window, "--clearmodifiers", "--delay", 1,
++            "echo CMUX_GUI_KEYBOARD")
++        xdo("key", "--window", window, "Return")
++        wait_for(lambda: "CMUX_GUI_KEYBOARD" in (line.rstrip() for line in client.request(
++            "read-screen", surface=surface)[0].get("text", "").splitlines()),
++                 "frontend keyboard input")
++        result["frontend_keyboard_input"] = True
++        if args.input_checks:
++            # GTK provides a real X11 clipboard owner in the isolated display.
++            # Keep the user's clipboard intact when testing on their desktop.
++            gtk_clipboard = """
++import sys, gi
++from pathlib import Path
++gi.require_version('Gtk', '3.0')
++from gi.repository import Gtk, Gdk, GLib
++clipboard = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY if sys.argv[1] == 'primary' else Gdk.SELECTION_CLIPBOARD)
++if sys.argv[2] == 'get':
++    sys.stdout.write(clipboard.wait_for_text() or '')
++else:
++    clipboard.set_text(sys.argv[2], -1)
++    if len(sys.argv) > 3: Path(sys.argv[3]).touch()
++    GLib.MainLoop().run()
++"""
++            def read_clipboard(selection="clipboard"):
++                return subprocess.check_output(["/usr/bin/python3", "-c", gtk_clipboard,
++                                                selection, "get"], env=env, text=True, timeout=5)
++            def own_clipboard(text, selection="clipboard"):
++                ready = out / f"clipboard-ready-{len(clipboard_owners)}"
++                owner = launch(["/usr/bin/python3", "-c", gtk_clipboard, selection,
++                                text, str(ready)], f"clipboard-{len(clipboard_owners)}.log")
++                clipboard_owners.append(owner)
++                wait_for(ready.exists, "clipboard owner")
++            def send(command):
++                client.request("send", surface=surface,
++                               bytes=base64.b64encode(command.encode()).decode())
++            def capture_input(name, action, expected, bracketed=False):
++                destination = out / (name + ".bin")
++                ready_marker = "INPUT_READY_" + name
++                capture = r"""
++import os, select, time, tty, termios
++from pathlib import Path
++original = termios.tcgetattr(0)
++received = b''
++try:
++ tty.setraw(0)
++ os.write(1, b'\x1b[2J\x1b[H' + (%r).encode() + (b'\x1b[?2004h' if %r else b'\x1b[?2004l'))
++ deadline = time.monotonic() + 20
++ while time.monotonic() < deadline:
++  if select.select([0], [], [], .1)[0]:
++   chunk = os.read(0, 65536)
++   if b'\x04' in chunk:
++    received += chunk.split(b'\x04')[0]
++    break
++   received += chunk
++finally:
++ termios.tcsetattr(0, termios.TCSANOW, original)
++ os.write(1, b'\x1b[?2004l\r\n')
++ Path(%r).write_bytes(received)
++""" % (ready_marker, bracketed, str(destination))
++                compile(capture, "capture-input", "exec")
++                capture_path = out / "capture-input.py"
++                capture_path.write_text(capture)
++                send("python3 " + shlex.quote(str(capture_path)) + "\n")
++                wait_for(lambda: ready_marker in (line.rstrip() for line in client.request(
++                    "read-screen", surface=surface)[0].get("text", "").splitlines()), "raw input reader")
++                action()
++                time.sleep(.5)
++                xdo("key", "--window", window, "ctrl+d")
++                wait_for(destination.exists, name + " result", timeout=25)
++                actual = destination.read_bytes()
++                result[name] = {"expected_hex": expected.hex(), "actual_hex": actual.hex(),
++                                "passed": actual == expected}
++                if actual != expected:
++                    raise RuntimeError(name + " input mismatch: " + repr(actual))
++            if not args.display:
++                payload = "中文粘贴🙂\nsecond line"
++                own_clipboard(payload)
++                capture_input("clipboard_bracketed", lambda: xdo("key", "--window", window, "ctrl+shift+v"),
++                              b"\x1b[200~" + payload.encode() + b"\x1b[201~", bracketed=True)
++                own_clipboard("ShiftInsert中文", "primary")
++                capture_input("clipboard_shift_insert", lambda: xdo("key", "--window", window, "shift+Insert"),
++                              "ShiftInsert中文".encode())
++                capture_input("control_keys", lambda: xdo("key", "--window", window,
++                              "ctrl+c", "ctrl+a", "Left", "BackSpace", "Return"), b"\x03\x01\x1b[D\x7f\r")
++                # OSC 52 exercises the Ghostty -> system clipboard callback without
++                # changing the shell or relying on pixel-dependent selection.
++                copied = "CMUX_COPY_中文"
++                send("printf '\\033]52;c;" + base64.b64encode(copied.encode()).decode() + "\\007'\n")
++                wait_for(lambda: read_clipboard() == copied, "terminal clipboard write")
++                result["clipboard_write"] = True
++            if args.ime_check:
++                original_ime_state = subprocess.check_output(["fcitx-remote"], env=ime_env, text=True).strip()
++                subprocess.run(["fcitx-remote", "-s", "sogoupinyin"], env=ime_env, check=True)
++                subprocess.run(["fcitx-remote", "-c"], env=ime_env, check=True)
++                def ime_key(*arguments):
++                    # XSendEvent (--window) marks keys EF_FINAL, deliberately
++                    # bypassing GTK IMEs. XTEST is required for real IME input.
++                    xdo("windowactivate", "--sync", window)
++                    xdo("windowfocus", "--sync", window)
++                    if xdo("getwindowfocus").strip() != str(window):
++                        raise RuntimeError("test window lost focus before IME input")
++                    xdo(*arguments)
++                def type_chinese():
++                    result["ime_modules"] = sorted({line.split()[-1] for line in
++                        Path(f"/proc/{browser.pid}/maps").read_text().splitlines()
++                        if "fcitx" in line or "libgtk" in line})
++                    result["ime_before_trigger"] = subprocess.check_output(
++                        ["fcitx-remote"], env=ime_env, text=True).strip()
++                    ime_key("key", "ctrl+space")
++                    time.sleep(.5)
++                    result["ime_after_trigger"] = subprocess.check_output(
++                        ["fcitx-remote"], env=ime_env, text=True).strip()
++                    result["ime_selected"] = subprocess.check_output([
++                        "dbus-send", "--bus=" + env["FCITX_DBUS_ADDRESS"],
++                        "--print-reply", "--dest=org.fcitx.Fcitx", "/inputmethod",
++                        "org.fcitx.Fcitx.InputMethod.GetCurrentIM"], text=True)
++                    if args.ime_toggle_shift:
++                        ime_key("key", "Shift_L")
++                    ime_key("type", "--delay", 150, "nihao")
++                    time.sleep(.8)
++                    geometry = dict(line.split("=", 1) for line in
++                        xdo("getwindowgeometry", "--shell", window).splitlines())
++                    crop = (f"{geometry['WIDTH']}x{geometry['HEIGHT']}"
++                            f"+{geometry['X']}+{geometry['Y']}")
++                    # Capture only the test window's screen rectangle, including
++                    # its IME popup; XGetImage(window) blacks out popup overlaps.
++                    subprocess.run(["import", "-window", "root", "-crop", crop,
++                                    str(out / "ime-preedit.png")],
++                                   env=env, check=True, capture_output=True)
++                    ime_key("key", "space")
++                    time.sleep(.5)
++                    if args.ime_toggle_shift:
++                        ime_key("key", "Shift_L")
++                    ime_key("key", "ctrl+space")
++                capture_input("sogou_commit", type_chinese, "你好".encode(), bracketed=True)
++            # Exercise the shipped settings UI and its persistence, through the
++            # isolated browser's debugging endpoint only.
++            import websocket
++            port = int(debug_file.read_text().splitlines()[0])
++            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++            xdo("key", "--window", window, "ctrl+comma")
++            def settings_page():
++                return next((t for t in page_targets() if
++                    t["url"].startswith(("chrome://cmux-configure", "cmux://settings"))), None)
++            settings_target = wait_for(settings_page, "settings shortcut")
++            xdo("key", "--window", window, "ctrl+comma")
++            time.sleep(.3)
++            if len(page_targets()) != 1:
++                raise RuntimeError("settings shortcut created a duplicate tab")
++            result["settings_shortcut_reuses_tab"] = True
++            connection = websocket.create_connection(settings_target["webSocketDebuggerUrl"],
++                                                       timeout=10, suppress_origin=True)
++            request_id = 0
++            def evaluate(expression):
++                nonlocal request_id
++                request_id += 1
++                connection.send(json.dumps({"id": request_id, "method": "Runtime.evaluate", "params": {
++                    "expression": expression, "awaitPromise": True, "returnByValue": True,
++                    "userGesture": True}}))
++                while True:
++                    reply = json.loads(connection.recv())
++                    if reply.get("id") == request_id:
++                        if "exceptionDetails" in reply.get("result", {}):
++                            raise RuntimeError(str(reply))
++                        return reply.get("result", {}).get("result", {}).get("value")
++            wait_for(lambda: evaluate("!!document.querySelector('#ui-font-size') && !document.querySelector('#ui-font-size').disabled"),
++                     "settings ready")
++            result["appearance_initial"] = evaluate("({ui:document.querySelector('#ui-font-size').value,terminal:document.querySelector('#terminal-font-size').value})")
++            evaluate("document.querySelector('#ui-font-size').value='18';document.querySelector('#terminal-font-size').value='20';document.querySelector('#ghostty-theme').value='Cmux Light';document.querySelector('#ghostty-theme').dispatchEvent(new Event('change'));true")
++            wait_for(lambda: (out / "layout.json").exists() and
++                     json.loads((out / "layout.json").read_text()).get("terminal_font_size") == 20,
++                     "settings saved")
++            wait_for(lambda: evaluate("document.querySelector('#customization-status').textContent.includes('Using Cmux Light')"),
++                     "theme applied")
++            result["appearance_saved"] = json.loads((out / "layout.json").read_text())
++            xdo("windowraise", window)
++            time.sleep(.5)
++            subprocess.run(["import", "-window", window, str(out / "settings.png")], env=env,
++                           check=True, capture_output=True)
++            connection.close()
++            with opener.open(f"http://127.0.0.1:{port}/json/close/{settings_target['id']}", timeout=5):
++                pass
++            time.sleep(.5)
++            xdo("windowfocus", "--sync", window)
++            xdo("mousemove", "--window", window, 400, 300)
++            xdo("click", "--window", window, 1)
++        # Exercise ongoing rendering and CJK fallback, not just an idle prompt.
++        command = ("printf '中文字体测试 ASCII 0123456789\\n'; "
++                   "i=0; while :; do i=$((i+1)); "
++                   "printf '\\rCMUX_LIVE_%06d' \"$i\"; sleep 0.1; done\n")
++        client.request("send", surface=surface,
++                       bytes=base64.b64encode(command.encode()).decode())
++        live_counter = 0
++        recording = None
++        if args.record_seconds:
++            recording = launch([
++                args.ffmpeg, "-y", "-nostdin", "-loglevel", "warning",
++                "-video_size", "1280x900", "-framerate", "20", "-f", "x11grab",
++                "-draw_mouse", "0", "-i", env["DISPLAY"],
++                "-t", str(args.record_seconds), "-c:v", "libx264",
++                "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p",
++                "-movflags", "+faststart", str(out / "steady-state.mp4")],
++                "recording.log")
++        deadline = time.monotonic() + max(args.hold_seconds, args.record_seconds)
++        def read_live_counter():
++            text = client.request("read-screen", surface=surface)[0].get("text", "")
++            matches = re.findall(r"CMUX_LIVE_(\d+)", text)
++            return int(matches[-1]) if matches else 0
++
++        while time.monotonic() < deadline:
++            wait_for(lambda: len(terminals()) == 4, "steady state", timeout=2)
++            live_counter = wait_for(
++                lambda: (value := read_live_counter()) > live_counter and value,
++                "continuous terminal output", timeout=2)
++            time.sleep(0.25)
++        result["continuous_output_counter"] = live_counter
++        if recording is not None and recording.wait(timeout=10) != 0:
++            raise RuntimeError("steady-state recording failed; see recording.log")
++        # XGetImage can return black/occluded pixels for a covered X11 window.
++        # Raise only this test's window before collecting visual evidence.
++        xdo("windowraise", window)
++        time.sleep(0.25)
++        subprocess.run(["import", "-window", window, str(out / "window.png")], env=env,
++                       check=True, capture_output=True)
++        log = (out / "browser.log").read_text(errors="replace")
++        geometry = [tuple(map(float, match)) for match in re.findall(
++            r"cmux-term-geometry: scale=([\d.]+) logical=(\d+)x(\d+) "
++            r"pixels=(\d+)x(\d+) cells=(\d+)x(\d+)", log)]
++        frames = set(re.findall(r"cmux-term-frame: pixels=(\d+x\d+)", log))
++        result["terminal_geometry"] = geometry[-8:]
++        result["rendered_frame_sizes"] = sorted(frames)
++        if args.scale is not None:
++            scaled = [g for g in geometry if abs(g[0] - args.scale) < .01]
++            if not scaled or not any(f"{int(g[3])}x{int(g[4])}" in frames for g in scaled):
++                raise RuntimeError("no rendered terminal frame at requested device scale")
++            if any(abs(g[3] - math.ceil(g[1] * g[0])) > 1 or
++                   abs(g[4] - math.ceil(g[2] * g[0])) > 1 for g in scaled):
++                raise RuntimeError("terminal framebuffer did not match physical pixel size")
++        result["unsupported_direct_retries"] = log.count("retrying direct renderer")
++        if result["unsupported_direct_retries"]:
++            raise RuntimeError("unsupported direct renderer is still being retried")
++        result["close_method"] = close_window(window)
++        result["graceful_exit_code"] = browser.wait(timeout=15)
++        if result["graceful_exit_code"] != 0:
++            raise RuntimeError(f"browser exited {result['graceful_exit_code']} on window close")
++        if args.input_checks:
++            # Browser close must preserve the daemon and exactly the same PTYs.
++            preserved = {t["terminal_id"] for t in terminals()}
++            browser = launch([str(args.browser.resolve()), *flags], "restart-browser.log")
++            window = wait_for(windows, "restart window")[-1]
++            time.sleep(3)
++            wait_for(lambda: not page_targets(), "restart without a new web tab")
++            result["restart_terminal_ids_preserved"] = preserved == {t["terminal_id"] for t in terminals()}
++            result["restart_web_pages"] = [t["url"] for t in page_targets()]
++            if not result["restart_terminal_ids_preserved"]:
++                raise RuntimeError("restart changed terminal identities")
++            subprocess.run(["import", "-window", window, str(out / "restart.png")], env=env,
++                           check=True, capture_output=True)
++            result["restart_close_method"] = close_window(window)
++            result["restart_exit_code"] = browser.wait(timeout=15)
++            if result["restart_exit_code"] != 0:
++                raise RuntimeError("restart did not exit cleanly")
++        if args.input_checks and result["startup_web_pages"]:
++            raise RuntimeError("unexpected startup web tab")
++        result["passed"] = True
++    except Exception as error:
++        result["error"] = str(error)
++        if browser is not None and browser.poll() is None:
++            try:
++                if result.get("shell_probe"):
++                    result["shell_probe_screen"] = client.request(
++                        "read-screen", surface=result["shell_probe"]["surface"])[0]
++                result["x_keyboard_focus"] = xdo("getwindowfocus")
++                result["terminal_snapshot"] = client.request("list-terminals")[0]
++                candidates = xdo("search", "--onlyvisible", "--pid", browser.pid).splitlines()
++                result["visible_windows"] = {
++                    identity: xdo("getwindowname", identity) for identity in candidates}
++                target = windows()
++                if target:
++                    subprocess.run(["import", "-window", target[-1],
++                                    str(out / "failure-window.png")], env=env,
++                                   check=True, capture_output=True)
++            except Exception as diagnostic_error:
++                result["diagnostic_error"] = str(diagnostic_error)
++    finally:
++        if args.ime_check and original_ime_state in ("1", "2"):
++            subprocess.run(["fcitx-remote", "-o" if original_ime_state == "2" else "-c"], env=ime_env)
++        if args.display and original_clipboard is not None:
++            # Klipper retains the original text after this short-lived owner exits.
++            try:
++                own_clipboard(original_clipboard)
++                own_clipboard(original_selection or "", "primary")
++                time.sleep(.4)
++            except Exception as error:
++                result["clipboard_restore_error"] = str(error)
++        result["elapsed_s"] = round(time.monotonic() - started, 3)
++        result["browser_exit_before_cleanup"] = browser.poll() if browser else None
++        # Snapshot only this test's descendants and exact session environment.
++        # Crashpad can reparent itself to PID 1 before this cleanup starts.
++        # Terminal hosts create their own process groups; never pkill cmux.
++        roots = {p.pid for p in processes}
++        owned = set(roots)
++        parents = {}
++        session_marker = ("CMUX_TUI_SESSION=" + runtime.name).encode()
++        for path in Path("/proc").iterdir():
++            try:
++                fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
++                parents[int(path.name)] = int(fields[1])
++                if session_marker in (path / "environ").read_bytes().split(b"\0"):
++                    owned.add(int(path.name))
++            except (OSError, ValueError, IndexError):
++                continue
++        while True:
++            children = {pid for pid, parent in parents.items() if parent in owned} - owned
++            if not children:
++                break
++            owned.update(children)
++        result["cleanup_pids"] = sorted(owned)
++        if client:
++            client.close()
++        for pid in sorted(owned - roots, reverse=True):
++            try:
++                os.kill(pid, signal.SIGTERM)
++            except ProcessLookupError:
++                pass
++        for process in reversed(processes):
++            if process.poll() is None:
++                process.terminate()
++            try:
++                process.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                process.kill()
++                process.wait(timeout=5)
++        for stream in files:
++            stream.close()
++        (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
++    print(json.dumps(result, indent=2))
++    return 0 if result["passed"] else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/linux-ghostty-lifecycle.c b/tests/linux-ghostty-lifecycle.c
+new file mode 100644
+index 0000000..b34a43e
+--- /dev/null
++++ b/tests/linux-ghostty-lifecycle.c
+@@ -0,0 +1,205 @@
++// Copyright 2026 Manaflow, Inc.
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Functional Linux embedder regression: replay must replace terminal contents,
++// and freeing interleaved surfaces must not invalidate a surviving renderer.
++// Build against the pinned Ghostty fork's include/ and zig-out/lib/ directories.
++#define _POSIX_C_SOURCE 200809L
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <assert.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "ghostty.h"
++
++struct host {
++  EGLDisplay display;
++  EGLSurface drawable;
++  EGLContext context;
++  ghostty_surface_t terminal;
++};
++
++static EGLDisplay display;
++static EGLConfig egl_config;
++static ghostty_app_t app;
++
++static bool make_current(void* userdata) {
++  struct host* host = userdata;
++  return eglMakeCurrent(host->display, host->drawable, host->drawable,
++                        host->context) == EGL_TRUE;
++}
++
++static void clear_current(void* userdata) {
++  struct host* host = userdata;
++  assert(eglMakeCurrent(host->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                       EGL_NO_CONTEXT) == EGL_TRUE);
++}
++
++static void* get_proc(void* userdata, const char* name) {
++  (void)userdata;
++  return (void*)eglGetProcAddress(name);
++}
++
++static void swap_buffers(void* userdata) {
++  struct host* host = userdata;
++  assert(eglSwapBuffers(host->display, host->drawable) == EGL_TRUE);
++}
++
++static void wakeup(void* userdata) { (void)userdata; }
++
++static bool action(ghostty_app_t a, ghostty_target_s target,
++                   ghostty_action_s event) {
++  (void)a;
++  if (event.tag == GHOSTTY_ACTION_RENDER &&
++      target.tag == GHOSTTY_TARGET_SURFACE) {
++    ghostty_surface_draw(target.target.surface);
++    return true;
++  }
++  return false;
++}
++
++static bool read_clipboard(void* userdata, ghostty_clipboard_e clipboard,
++                           void* state) {
++  (void)userdata;
++  (void)clipboard;
++  (void)state;
++  return false;
++}
++
++static void confirm_clipboard(void* userdata, const char* text, void* state,
++                              ghostty_clipboard_request_e request) {
++  (void)userdata;
++  (void)text;
++  (void)state;
++  (void)request;
++}
++
++static void write_clipboard(void* userdata, ghostty_clipboard_e clipboard,
++                            const ghostty_clipboard_content_s* content,
++                            size_t count, bool confirm) {
++  (void)userdata;
++  (void)clipboard;
++  (void)content;
++  (void)count;
++  (void)confirm;
++}
++
++static void close_surface(void* userdata, bool alive) {
++  (void)userdata;
++  (void)alive;
++}
++
++static void io_write(void* userdata, const char* text, uintptr_t length) {
++  (void)userdata;
++  (void)text;
++  (void)length;
++}
++
++static void tick(void) {
++  const struct timespec delay = {.tv_nsec = 1000000};
++  for (int i = 0; i < 10; ++i) {
++    ghostty_app_tick(app);
++    nanosleep(&delay, NULL);
++  }
++}
++
++static void create_host(struct host* host) {
++  const EGLint pbuffer[] = {EGL_WIDTH, 640, EGL_HEIGHT, 360, EGL_NONE};
++  const EGLint context[] = {EGL_CONTEXT_MAJOR_VERSION_KHR, 4,
++                            EGL_CONTEXT_MINOR_VERSION_KHR, 3,
++                            EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
++                            EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR, EGL_NONE};
++  *host = (struct host){.display = display};
++  host->drawable = eglCreatePbufferSurface(display, egl_config, pbuffer);
++  host->context = eglCreateContext(display, egl_config, EGL_NO_CONTEXT, context);
++  assert(host->drawable != EGL_NO_SURFACE && host->context != EGL_NO_CONTEXT);
++  ghostty_surface_config_s config = ghostty_surface_config_new();
++  config.platform_tag = GHOSTTY_PLATFORM_OPENGL;
++  config.platform.opengl = (ghostty_platform_opengl_s){
++      host, make_current, clear_current, get_proc, swap_buffers};
++  config.userdata = host;
++  config.io_mode = GHOSTTY_SURFACE_IO_MANUAL_MIRROR;
++  config.io_write_cb = io_write;
++  host->terminal = ghostty_surface_new(app, &config);
++  assert(host->terminal);
++  ghostty_surface_set_size(host->terminal, 640, 360);
++  tick();
++}
++
++static void free_host(struct host* host) {
++  ghostty_surface_free(host->terminal);
++  host->terminal = NULL;
++  assert(eglDestroyContext(display, host->context));
++  assert(eglDestroySurface(display, host->drawable));
++  tick();
++}
++
++static void check_replay(struct host* host) {
++  const char old[] = "STALE-CONTENT\r\n";
++  const char replay[] = "\x1b" "c" "\x1b[3JFRESH-CONTENT\r\n";
++  ghostty_surface_process_output(host->terminal, old, sizeof(old) - 1);
++  ghostty_surface_process_output(host->terminal, replay, sizeof(replay) - 1);
++  tick();
++  const ghostty_selection_s selection = {
++      .top_left = {GHOSTTY_POINT_SCREEN, GHOSTTY_POINT_COORD_TOP_LEFT, 0, 0},
++      .bottom_right = {GHOSTTY_POINT_SCREEN, GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
++                      0, 0}};
++  ghostty_text_s output = {0};
++  assert(ghostty_surface_read_text(host->terminal, selection, &output));
++  char* text = strndup(output.text, output.text_len);
++  assert(text && strstr(text, "FRESH-CONTENT") && !strstr(text, "STALE-CONTENT"));
++  free(text);
++  ghostty_surface_free_text(host->terminal, &output);
++}
++
++int main(void) {
++  setvbuf(stdout, NULL, _IONBF, 0);
++  display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
++                                   EGL_DEFAULT_DISPLAY, NULL);
++  assert(display != EGL_NO_DISPLAY && eglInitialize(display, NULL, NULL));
++  assert(eglBindAPI(EGL_OPENGL_API));
++  const EGLint attrs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
++                          EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++                          EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
++                          EGL_NONE};
++  EGLint configs = 0;
++  assert(eglChooseConfig(display, attrs, &egl_config, 1, &configs) && configs == 1);
++  assert(ghostty_init(0, NULL) == GHOSTTY_SUCCESS);
++  ghostty_config_t config = ghostty_config_new();
++  const char options[] = "font-family = DejaVu Sans Mono\nfont-size = 12\n";
++  ghostty_config_load_string(config, options, sizeof(options) - 1,
++                             "cmux://linux-lifecycle-test");
++  ghostty_config_finalize(config);
++  assert(ghostty_config_diagnostics_count(config) == 0);
++  const ghostty_runtime_config_s runtime = {
++      .wakeup_cb = wakeup, .action_cb = action,
++      .read_clipboard_cb = read_clipboard,
++      .confirm_read_clipboard_cb = confirm_clipboard,
++      .write_clipboard_cb = write_clipboard, .close_surface_cb = close_surface};
++  app = ghostty_app_new(&runtime, config);
++  assert(app);
++  ghostty_config_free(config);
++  for (int cycle = 0; cycle < 30; ++cycle) {
++    struct host hosts[3];
++    for (int i = 0; i < 3; ++i) {
++      create_host(&hosts[i]);
++      check_replay(&hosts[i]);
++    }
++    // Free a younger surface before an older one, then create another while
++    // the oldest remains alive: this exercises the reported failing order.
++    free_host(&hosts[1]);
++    check_replay(&hosts[0]);
++    create_host(&hosts[1]);
++    free_host(&hosts[2]);
++    free_host(&hosts[0]);
++    free_host(&hosts[1]);
++    printf("PASS lifecycle cycle %d\n", cycle + 1);
++  }
++  ghostty_app_free(app);
++  assert(eglTerminate(display));
++  puts("PASS replay replacement and 120 surface create/free operations");
++  return 0;
++}
+
+From bcbf0522fbc940f10cfc9720c2b0101924d55bf4 Mon Sep 17 00:00:00 2001
+From: Steve-Strange <120027032+Steve-Strange@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:12:08 +0800
+Subject: [PATCH 3/4] build(linux): preserve local repairs and package
+ appearance presets
+
+A local-build marker disables official update checks and installer handoff. Package two appearance presets and retain real Chromium/source identities. Make Linux overlay application idempotent.
+---
+ .../cmux_term/cmux_update_installer.cc        |  13 +-
+ .../browser/cmux_term/cmux_update_installer.h |   1 +
+ .../browser/cmux_term/cmux_update_service.cc  |  14 +++
+ packaging/linux/themes/Cmux Dark              |  23 ++++
+ packaging/linux/themes/Cmux Light             |  23 ++++
+ scripts/apply.sh                              |   7 +-
+ scripts/package-linux-local.py                | 119 ++++++++++++++++++
+ 7 files changed, 198 insertions(+), 2 deletions(-)
+ create mode 100644 packaging/linux/themes/Cmux Dark
+ create mode 100644 packaging/linux/themes/Cmux Light
+ create mode 100644 scripts/package-linux-local.py
+
+diff --git a/overlay/chrome/browser/cmux_term/cmux_update_installer.cc b/overlay/chrome/browser/cmux_term/cmux_update_installer.cc
+index 0d91911..a417c0b 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_update_installer.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_update_installer.cc
+@@ -38,13 +38,24 @@ base::FilePath CurrentInstallRoot() {
+ 
+ }  // namespace
+ 
++bool IsLocalCmuxBuild() {
++  const base::FilePath current = CurrentInstallRoot();
++  return !current.empty() &&
++         base::PathExists(current.AppendASCII("cmux-local-build.json"));
++}
++
+ bool CurrentInstallCanBeReplaced() {
+   const base::FilePath current = CurrentInstallRoot();
+-  return !current.empty() && base::PathExists(current) &&
++  return !IsLocalCmuxBuild() && !current.empty() && base::PathExists(current) &&
+          base::PathIsWritable(current.DirName());
+ }
+ 
+ bool LaunchReadyUpdateInstaller(const ReadyUpdate& update) {
++  // A verified official package can still regress a locally repaired build.
++  // Recheck at handoff, including when an update was staged earlier.
++  if (IsLocalCmuxBuild()) {
++    return false;
++  }
+   const base::FilePath current = CurrentInstallRoot();
+   if (current.empty() || update.staged_root.empty() ||
+       !base::PathExists(update.staged_root)) {
+diff --git a/overlay/chrome/browser/cmux_term/cmux_update_installer.h b/overlay/chrome/browser/cmux_term/cmux_update_installer.h
+index 551b00e..0a02d90 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_update_installer.h
++++ b/overlay/chrome/browser/cmux_term/cmux_update_installer.h
+@@ -17,6 +17,7 @@ struct ReadyUpdate {
+ };
+ 
+ // Blocking filesystem preflight; call on a MayBlock sequence.
++bool IsLocalCmuxBuild();
+ bool CurrentInstallCanBeReplaced();
+ 
+ // Writes a detached, platform-native swap helper and starts it. The helper
+diff --git a/overlay/chrome/browser/cmux_term/cmux_update_service.cc b/overlay/chrome/browser/cmux_term/cmux_update_service.cc
+index ea280a0..29abd4f 100644
+--- a/overlay/chrome/browser/cmux_term/cmux_update_service.cc
++++ b/overlay/chrome/browser/cmux_term/cmux_update_service.cc
+@@ -357,6 +357,20 @@ class CmuxUpdateServiceImpl {
+   ~CmuxUpdateServiceImpl() = default;
+ 
+   void Start() {
++    base::ThreadPool::PostTaskAndReplyWithResult(
++        FROM_HERE, {base::MayBlock(), base::TaskPriority::USER_VISIBLE},
++        base::BindOnce(&IsLocalCmuxBuild),
++        base::BindOnce(&CmuxUpdateServiceImpl::OnLocalBuildChecked,
++                       weak_factory_.GetWeakPtr()));
++  }
++
++  void OnLocalBuildChecked(bool is_local) {
++    // Local repair packages have their own source and deployment lifecycle.
++    // Do not offer an upstream binary that silently discards those patches.
++    if (is_local) {
++      LOG(INFO) << "cmux-update: local build; official updates disabled";
++      return;
++    }
+     network_monitor_->Start(base::BindRepeating(
+         &CmuxUpdateServiceImpl::OnConnectionCost, weak_factory_.GetWeakPtr()));
+     check_timer_.Start(FROM_HERE, kCheckInterval, this,
+diff --git a/packaging/linux/themes/Cmux Dark b/packaging/linux/themes/Cmux Dark
+new file mode 100644
+index 0000000..b05c06c
+--- /dev/null
++++ b/packaging/linux/themes/Cmux Dark	
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: GPL-3.0-or-later
++# A simple high-contrast palette for the local Linux package.
++background = #181b22
++foreground = #e5e9f0
++cursor-color = #e5e9f0
++selection-background = #3d526e
++selection-foreground = #ffffff
++palette = 0=#252a34
++palette = 1=#ef8585
++palette = 2=#a3d69c
++palette = 3=#ebcd86
++palette = 4=#8db9ef
++palette = 5=#c7a3e8
++palette = 6=#8fd2d1
++palette = 7=#d8dee9
++palette = 8=#737f91
++palette = 9=#ffaaaa
++palette = 10=#bfedb8
++palette = 11=#ffe6a3
++palette = 12=#b1d2ff
++palette = 13=#e2c0ff
++palette = 14=#b3eeee
++palette = 15=#ffffff
+diff --git a/packaging/linux/themes/Cmux Light b/packaging/linux/themes/Cmux Light
+new file mode 100644
+index 0000000..182ac5a
+--- /dev/null
++++ b/packaging/linux/themes/Cmux Light	
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: GPL-3.0-or-later
++# A simple high-contrast palette for the local Linux package.
++background = #f5f6f8
++foreground = #242a34
++cursor-color = #242a34
++selection-background = #c8d9f0
++selection-foreground = #172336
++palette = 0=#242a34
++palette = 1=#aa2936
++palette = 2=#35703b
++palette = 3=#825f13
++palette = 4=#285c9e
++palette = 5=#7c4698
++palette = 6=#246d77
++palette = 7=#c6cbd3
++palette = 8=#647080
++palette = 9=#be3443
++palette = 10=#437d46
++palette = 11=#92701c
++palette = 12=#326caf
++palette = 13=#8d53a8
++palette = 14=#287d88
++palette = 15=#ffffff
+diff --git a/scripts/apply.sh b/scripts/apply.sh
+index ee943cf..b1308ba 100755
+--- a/scripts/apply.sh
++++ b/scripts/apply.sh
+@@ -410,6 +410,11 @@ if '# cmux cross-platform' in s:
+          f'      {quote}cmux_term/cmux_terminal_pane_linux.cc{quote},\n'),
+     ]
+     for source, anchor in platform_sources:
++        # A Linux source snapshot never received the macOS-only source block.
++        # Do not require its anchors when reapplying the Linux overlay.
++        if MODE != 'full' and (source.endswith('.mm') or
++                               source == 'cmux_term/cmux_app_icon.h'):
++            continue
+         source_scope = s
+         if source == 'cmux_term/cmux_ghostty_opengl_host.cc':
+             linux_start = s.index(
+@@ -1728,7 +1733,7 @@ new = '''  if (allow_user_level_hosts) {
+     result = FindManifestInDir(chrome::DIR_NATIVE_MESSAGING, host_name);
+   }
+ '''
+-if 'tools such as Claude Code install native host manifests' not in s:
++if '// cmux uses its own product/profile directory' not in s:
+     assert s.count(old) == 1, 'native host fallback anchor changed'
+     s = s.replace(old, new, 1)
+ open(p, 'w').write(s)
+diff --git a/scripts/package-linux-local.py b/scripts/package-linux-local.py
+new file mode 100644
+index 0000000..a7a0abb
+--- /dev/null
++++ b/scripts/package-linux-local.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""Package a verified local Linux build without stamping an official release."""
++
++import argparse
++from datetime import datetime, timezone
++import json
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--build-root", type=Path, required=True)
++    parser.add_argument("--runtime", type=Path, required=True,
++                        help="Existing official installation supplying the pinned backend")
++    args = parser.parse_args()
++    project = Path(__file__).resolve().parent.parent
++    build = args.build_root.resolve()
++    out = build / "chromium/src/out/Release"
++    runtime = args.runtime.resolve()
++    source = json.loads((project / "SOURCE-MANIFEST.json").read_text())
++    expected = {d["name"]: d["commit"] for d in source["dependencies"]}
++    for filename, revision in (("cmux-tui.REVISION", expected["cmux and cmux-tui"]),
++                               ("cmux-tui.GHOSTTY_REVISION", expected["Ghostty"])):
++        if (runtime / filename).read_text().strip() != revision:
++            raise RuntimeError("Runtime revision mismatch: " + filename)
++    required = {
++        "chrome": "chrome", "chrome_crashpad_handler": "chrome_crashpad_handler",
++        "chrome_sandbox": "chrome-sandbox", "chrome_management_service": "chrome-management-service",
++        "resources.pak": "resources.pak", "icudtl.dat": "icudtl.dat",
++        "chrome_100_percent.pak": "chrome_100_percent.pak",
++        "chrome_200_percent.pak": "chrome_200_percent.pak",
++        "v8_context_snapshot.bin": "v8_context_snapshot.bin",
++    }
++    for filename in required:
++        if not (out / filename).is_file():
++            raise RuntimeError("Build output missing: " + filename)
++    for filename in ("locales/zh-CN.pak", "locales/en-US.pak", "terminfo/x/xterm-ghostty"):
++        if not (out / filename).is_file():
++            raise RuntimeError("Runtime output missing: " + filename)
++    credits = out / "gen/components/resources/about_credits.html"
++    if not credits.is_file() or "To get correct credits page" in credits.read_text():
++        raise RuntimeError("Generated Chromium license credits missing")
++    package = build / "package"
++    package.mkdir(exist_ok=True)
++    destination = package / "cmux-browser"
++    if destination.exists() and not (destination / "cmux-local-build.json").is_file():
++        raise RuntimeError("Refusing to replace an unrecognized package directory")
++    with tempfile.TemporaryDirectory(prefix=".local-stage-", dir=package) as scratch:
++        stage = Path(scratch) / "cmux-browser"
++        stage.mkdir()
++        stripped = []
++        for filename, target in required.items():
++            shutil.copy2(out / filename, stage / target)
++            if filename in ("chrome", "chrome_crashpad_handler", "chrome_sandbox", "chrome_management_service"):
++                (stage / target).chmod(0o755)
++                stripped.append(stage / target)
++        for filename in ("libqt5_shim.so", "libqt6_shim.so", "libvk_swiftshader.so",
++                         "libvulkan.so.1", "vk_swiftshader_icd.json"):
++            if (out / filename).is_file():
++                shutil.copy2(out / filename, stage / filename)
++                if ".so" in filename:
++                    stripped.append(stage / filename)
++        shutil.copytree(out / "locales", stage / "locales")
++        for dirname in ("MEIPreload", "PrivacySandboxAttestationsPreloaded", "IwaKeyDistribution",
++                        "ghostty", "terminfo"):
++            if (out / dirname).is_dir():
++                shutil.copytree(out / dirname, stage / dirname, symlinks=True)
++        # Public Linux resources ship an empty themes directory. Include two
++        # small presets so the Appearance picker works in the local package.
++        for theme in (project / "packaging/linux/themes").iterdir():
++            for resources in (stage, out):
++                (resources / "ghostty/themes").mkdir(parents=True, exist_ok=True)
++                shutil.copy2(theme, resources / "ghostty/themes" / theme.name)
++        for filename in ("cmux-tui", "cmux-tui.REVISION", "cmux-tui.GHOSTTY_REVISION",
++                         "cmux-tui.GHOSTTY_RESOURCES_MANIFEST.sha256"):
++            shutil.copy2(runtime / filename, stage / filename)
++        for path in runtime.glob("product_logo_*.png"):
++            shutil.copy2(path, stage / path.name)
++        for dirname in ("cmux-licenses", "extensions"):
++            if (runtime / dirname).is_dir():
++                shutil.copytree(runtime / dirname, stage / dirname, symlinks=True)
++        (stage / "cmux-licenses").mkdir(exist_ok=True)
++        shutil.copy2(credits, stage / "cmux-licenses/Chromium-about-credits.html")
++        strip = build / "chromium/src/third_party/llvm-build/Release+Asserts/bin/llvm-strip"
++        for path in stripped:
++            subprocess.run([str(strip), "--strip-debug", str(path)], check=True)
++        version = dict(line.split("=", 1) for line in
++                       (build / "chromium/src/chrome/VERSION").read_text().splitlines())
++        metadata = {
++            "kind": "local Linux repair build, not an official release",
++            "created_at_utc": datetime.now(timezone.utc).isoformat(),
++            "public_source_revision": source["source"]["commit"],
++            "chromium_version": ".".join(version[k] for k in ("MAJOR", "MINOR", "BUILD", "PATCH")),
++            "source_worktree": str(project),
++            "source_base_commit": subprocess.check_output(
++                ["git", "-C", str(project), "rev-parse", "HEAD"], text=True).strip(),
++            "local_changes_present": bool(subprocess.check_output(
++                ["git", "-C", str(project), "status", "--porcelain"], text=True).strip()),
++            "frontend_ghostty_revision": expected["Ghostty"],
++            "reused_backend_revision": expected["cmux and cmux-tui"],
++            "gn_args": (out / "args.gn").read_text(),
++            "official_updates_disabled": True,
++            "repair_notes": str(project / "docs/linux-repair.md"),
++        }
++        metadata_text = json.dumps(metadata, indent=2) + "\n"
++        (stage / "cmux-local-build.json").write_text(metadata_text)
++        # Protect direct launches from the build tree as well as the package.
++        (out / "cmux-local-build.json").write_text(metadata_text)
++        if destination.exists():
++            shutil.rmtree(destination)
++        shutil.move(stage, destination)
++    print(destination)
++
++
++if __name__ == "__main__":
++    main()
+
+From 98fa41c670f7923a2cfcec9a623b5acb8c8445a2 Mon Sep 17 00:00:00 2001
+From: Steve-Strange <120027032+Steve-Strange@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:12:08 +0800
+Subject: [PATCH 4/4] docs: describe Linux repairs, validation and platform
+ limits
+
+---
+ README.md            |   2 +
+ docs/linux-repair.md | 101 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+)
+ create mode 100644 docs/linux-repair.md
+
+diff --git a/README.md b/README.md
+index ec02cb2..590d944 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,7 @@
+ # cmux-browser
+ 
++Community Linux repair details and validation: [Linux repairs](docs/linux-repair.md).
++
+ A Chromium fork that is one app: real Chrome web tabs + omnibar (unmodified engine UX), our own custom browser UI on top, and **Ghostty terminals as first-class surfaces** in the same window/compositor.
+ 
+ This is the alternate to [cmux-owl](https://github.com/manaflow-ai/cmux-owl). OWL kept Chromium out-of-process and read pixels back into a Swift shell; every UX rough edge lived in that readback seam. cmux-browser deletes the seam by building our UI and the terminal directly into the Chromium browser process, so web rendering, resize, input, IME, and the omnibar are Chrome-quality for free. The cost is maintaining a browser-UI fork. See [docs/DESIGN.md](docs/DESIGN.md).
+diff --git a/docs/linux-repair.md b/docs/linux-repair.md
+new file mode 100644
+index 0000000..659fdfe
+--- /dev/null
++++ b/docs/linux-repair.md
+@@ -0,0 +1,101 @@
++# Linux repair patch set
++
++This is a community repair of the published cmux Browser corresponding source.
++It is not an official release. The original source manifest and licenses remain
++unchanged.
++
++## Source identity and scope
++
++- Published binary: `151.0.7922.64`.
++- Browser source: `dd7984e7ea68ee42768feebe3691b7b7ffdca6e6`.
++- Pinned Chromium and locally built version: `151.0.7922.34`.
++- cmux-tui: `f6085bbb9259767f94ed4890b0eb8df609209936`.
++- Ghostty: `50ad1963d9c73ee957932ccb4d26bf6d15575ee7`.
++- Verified desktop: Ubuntu 24.04.3, KDE/X11, RTX 5090, 1.75 device scale.
++
++The local Git import is not the original private upstream Git commit. Source
++comes from the release archive linked by `manaflow-ai/cmux-v2`; the backend
++binary is reused at the pinned revision. Related public reports are
++[manaflow-ai/cmux-v2#15](https://github.com/manaflow-ai/cmux-v2/issues/15) and
++[#16](https://github.com/manaflow-ai/cmux-v2/issues/16).
++
++## Resulting behavior
++
++- Non-macOS frontends no longer attempt the permanently unsupported direct
++  renderer every 200 ms. Mirror replay resets existing VT state in place.
++- EGL displays are retained until the final host releases them; unloading GL
++  clears its tracked handle first. Browser/window/extension teardown releases
++  references before the referenced objects disappear. Closed surfaces are freed.
++- Ghostty content scale follows the compositor; the framebuffer uses physical
++  pixels. At 1.75 scale, a 426x398 logical pane produced a 746x697 framebuffer.
++- Clipboard paste, X11 PRIMARY and writes are connected to Chromium, including
++  asynchronous completion and Ghostty confirmation. Clipboard shortcuts retain
++  printable key identity under Control.
++- The terminal implements Chromium TextInputClient for composition, candidate
++  position and committed text. Sogou commits are typing, not bracketed paste.
++- Terminal Control chords reach the PTY. Ctrl+, opens or reuses settings.
++  Appearance exposes sidebar/tab font size 10-22, terminal size 8-32, reset,
++  and light/dark presets; changes apply immediately and persist.
++- Initial canonical workspace projection uses an empty pane, without inserting
++  an unwanted browser tab. Explicit web-tab/URL opening remains available.
++- Linux update/install cleanup preserves an old install while a process is
++  executing from it. A surviving daemon therefore retains a valid executable
++  path for spawning new terminal hosts. There is no automatic garbage collector
++  for directories retained this way.
++- Locally marked builds skip official update checks and reject cached official
++  installer handoff. Official packages without the marker keep their updater.
++
++## Validation
++
++These are recorded local results, not upstream CI or a claim about every driver.
++
++| Check | Observed result |
++| --- | --- |
++| Host/model suite | 28 checks passed |
++| Update-script regressions | 19 checks passed, including a real surviving executable |
++| User installer | Passed live-executable preservation and subsequent unused-directory cleanup |
++| Real Chromium EGL adapter | Mesa and system graphics each passed 30 cycles / 120 host creations and releases |
++| Native desktop lifecycle, before the final input changes | Four terminals, 30 close/create/resize cycles, 300 seconds output; total 330.343 seconds; exit 0; zero unsupported-renderer retries |
++| Final package input test | Qt/X11, Xvfb/Mesa, 1.75 scale; Chinese/emoji/multiline bracketed paste, PRIMARY, Control keys, clipboard write, settings reuse and persistence; 20.151 seconds; both GUI exits 0 |
++| Final installed Sogou test | Native KDE/X11; Ctrl+Space activation, `nihao` + Space; PTY received exactly UTF-8 `e4bda0e5a5bd` (你好), without bracketed-paste wrappers; 38.045 seconds; both GUI exits 0 |
++| GUI restart in final tests | Four existing terminal identities preserved, zero placeholder web pages |
++
++GUI restart kept backend/PTY processes alive. **Cold boot, tmux resurrection,
++SSH reconnection, Codex conversation resume, and AI completion notifications are
++not implemented or validated by this patch set.** Wayland, Windows and macOS
++build/runtime behavior are untested. Some changes touch shared source; maintainers
++must run their platform builds before integration. Short local lifecycle tests
++do not establish permanent stability. Existing final test evidence predates
++this publication; publication reruns host/installer and patch-application checks.
++
++## Reproduce
++
++Follow the published source's build instructions and its pinned dependencies.
++Do not substitute a different backend or Ghostty ABI. For a local Linux build,
++`scripts/package-linux-local.py --build-root BUILD_ROOT --runtime PINNED_INSTALL`
++packages verified build outputs and marks the result as a local build.
++
++```sh
++bash scripts/run-host-tests.sh
++bash scripts/test-linux-user-installer.sh
++python3 scripts/test-linux-terminal-lifecycle.py \
++  --browser /absolute/path/to/chrome \
++  --backend /absolute/path/to/cmux-tui \
++  --output /absolute/path/to/new-isolated-run \
++  --scale 1.75 --input-checks --hold-seconds 20
++```
++
++For real Sogou validation, use an existing X11 desktop with Sogou/Fcitx configured,
++`--display :DISPLAY --toolkit native --native-rendering --ime-check`. The optional
++`--ime-toggle-shift` is only appropriate when Sogou initially uses its internal
++English mode. Use XTEST, not XSendEvent, for IME testing. The harness temporarily
++selects Sogou and changes activation state; run it on a dedicated test desktop.
++
++The GUI harness uses isolated browser/config/backend state and cleans only its
++own test processes. It requires Xvfb, xdotool, ImageMagick, and (for a managed
++desktop) wmctrl; clipboard checks require GTK Python bindings. The real EGL
++adapter is a separate Chromium GN target, `cmux_ghostty_opengl_host_test`, and
++must be compiled/run in the pinned Chromium tree.
++
++Publish only synthetic-test summaries. User profiles, terminal captures,
++workspace databases and credentials are not part of this contribution.

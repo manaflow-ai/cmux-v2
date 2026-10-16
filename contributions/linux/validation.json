@@ -1,0 +1,100 @@
+{
+  "kind": "community Linux source repair; not an official release",
+  "public_source_revision": "dd7984e7ea68ee42768feebe3691b7b7ffdca6e6",
+  "source_import_commit": "a64f83a2f61fb8c1c8cdb68e01acb87728c0fbe6",
+  "repaired_source_commit": "98fa41c670f7923a2cfcec9a623b5acb8c8445a2",
+  "published_binary_version": "151.0.7922.64",
+  "local_chromium_version": "151.0.7922.34",
+  "environment": {
+    "os": "Ubuntu 24.04.3",
+    "desktop": "KDE/X11",
+    "gpu": "RTX 5090",
+    "device_scale": 1.75
+  },
+  "publication_checks": {
+    "host_tests": {
+      "passed": 28,
+      "failed": 0
+    },
+    "linux_user_installer": "passed",
+    "mailbox_commits": 4,
+    "mailbox_reconstructs_source_tree": true,
+    "modified_frontend_files_match_validated_build": 24
+  },
+  "recorded_gui_runs": [
+    {
+      "name": "native-lifecycle",
+      "passed": true,
+      "toolkit": "native",
+      "native_rendering": true,
+      "cycles": 30,
+      "hold_seconds": 300.0,
+      "elapsed_s": 330.343,
+      "unsupported_direct_retries": 0,
+      "graceful_exit_code": 0,
+      "frontend_keyboard_input": true
+    },
+    {
+      "name": "input-packaged-close",
+      "passed": true,
+      "toolkit": "qt",
+      "native_rendering": false,
+      "cycles": 2,
+      "hold_seconds": 5.0,
+      "elapsed_s": 20.151,
+      "unsupported_direct_retries": 0,
+      "graceful_exit_code": 0,
+      "restart_exit_code": 0,
+      "restart_terminal_ids_preserved": true,
+      "frontend_keyboard_input": true,
+      "settings_shortcut_reuses_tab": true,
+      "clipboard_write": true,
+      "clipboard_bracketed": {
+        "expected_hex": "1b5b3230307ee4b8ade69687e7b298e8b4b4f09f99820a7365636f6e64206c696e651b5b3230317e",
+        "actual_hex": "1b5b3230307ee4b8ade69687e7b298e8b4b4f09f99820a7365636f6e64206c696e651b5b3230317e",
+        "passed": true
+      },
+      "clipboard_shift_insert": {
+        "expected_hex": "5368696674496e73657274e4b8ade69687",
+        "actual_hex": "5368696674496e73657274e4b8ade69687",
+        "passed": true
+      },
+      "control_keys": {
+        "expected_hex": "03011b5b447f0d",
+        "actual_hex": "03011b5b447f0d",
+        "passed": true
+      },
+      "startup_web_page_count": 0,
+      "restart_web_page_count": 0
+    },
+    {
+      "name": "input-installed-sogou",
+      "passed": true,
+      "toolkit": "native",
+      "native_rendering": true,
+      "cycles": 3,
+      "hold_seconds": 20.0,
+      "elapsed_s": 38.045,
+      "unsupported_direct_retries": 0,
+      "graceful_exit_code": 0,
+      "restart_exit_code": 0,
+      "restart_terminal_ids_preserved": true,
+      "frontend_keyboard_input": true,
+      "settings_shortcut_reuses_tab": true,
+      "sogou_commit": {
+        "expected_hex": "e4bda0e5a5bd",
+        "actual_hex": "e4bda0e5a5bd",
+        "passed": true
+      },
+      "startup_web_page_count": 0,
+      "restart_web_page_count": 0
+    }
+  ],
+  "limits": [
+    "GUI restart retained backend/PTY processes; no cold-boot recovery validation",
+    "Wayland, Windows and macOS are untested",
+    "No AI conversation restoration, SSH reconnection, tmux resurrection or completion notifications in this patch set",
+    "Native 300-second lifecycle run predates the final input changes; final input runs are listed separately",
+    "Finite local tests do not prove permanent stability"
+  ]
+}
