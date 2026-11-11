@@ -16,8 +16,8 @@ Linux copies that are already installed keep updating from the signed feed in
 this repository.
 
 When a platform is open for download, the `cmux.com` links are the stable
-download contract. The server verifies the P-256-signed update feed, selects the requested platform and architecture, and
-redirects only to an allowlisted asset in this public repository. Versioned
+download contract. The server verifies the P-256-signed update feed, selects
+the requested platform and architecture, and redirects only to an allowlisted asset in this public repository. Versioned
 binaries live on immutable `nightly-<version>` releases, so do not construct a
 `releases/download/nightly/<binary>` URL; moving-channel binary assets are not
 part of the durable contract.
