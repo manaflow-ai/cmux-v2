@@ -7,28 +7,19 @@ builds. Product development happens in a separate private repository.
 
 ### Linux x64 nightly
 
-**[Open the cmux Browser download page for Linux](https://cmux.com/linux)**
+Linux is waitlist-only on cmux.com for now. There is no public first-install
+download.
 
-Recommended first install:
+**[Join the Linux waitlist on the cmux Browser page](https://cmux.com/browser)**
 
-**[Download the Linux x64 per-user installer (.run)](https://cmux.com/api/download/browser-nightly/linux-x64/run)**
+Linux copies that are already installed keep updating from the signed feed in
+this repository.
 
-This is the recommended first-install download for a Linux desktop. It installs
-below `~/.local` without root access so cmux Browser can apply future signed
-updates atomically.
-
-Other Linux nightly files:
-
-- Debian/Ubuntu package:
-  [download `cmux-linux-x64.deb`](https://cmux.com/api/download/browser-nightly/linux-x64/deb).
-  This root-owned installation must be updated through the package manager.
-- In-app updater payload only, **not a first installer**:
-  [`cmux-linux-x64.zip`](https://cmux.com/api/download/browser-nightly/linux-x64/zip).
-
-The `cmux.com` links are the stable download contract. The server verifies the
-P-256-signed update feed, selects the requested platform and architecture, and
-redirects only to an allowlisted asset in this public repository. Versioned
-binaries live on immutable `nightly-<version>` releases, so do not construct a
+When a platform is open for download, the `cmux.com` links are the stable
+download contract. The server verifies the P-256-signed update feed, selects
+the requested platform and architecture, and redirects only to an allowlisted
+asset in this public repository. Versioned binaries live on immutable
+`nightly-<version>` releases, so do not construct a
 `releases/download/nightly/<binary>` URL; moving-channel binary assets are not
 part of the durable contract.
 
@@ -36,7 +27,7 @@ part of the durable contract.
 
 | Platform | Status | Supported download |
 | --- | --- | --- |
-| Linux (x64) | Available | [Linux download page](https://cmux.com/linux) |
+| Linux (x64) | Waitlist | No public download; [join the waitlist](https://cmux.com/browser). Installed copies keep updating from the signed feed |
 | macOS (Universal 2) | Unavailable | No download until the signed feed contains both `mac-arm64` and `mac-x64` and the notarized universal assets pass fresh-install checks |
 | Windows (x64) | Unavailable | No download until the signed feed contains `windows-x64` and the Authenticode-signed assets pass fresh-install checks |
 
